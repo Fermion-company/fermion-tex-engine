@@ -1,0 +1,151 @@
+\documentclass{article}
+
+% --- Fermion TeX Engine demo document -------------------------------
+% Macros are tracked by the dependency graph: change a definition below
+% and only the blocks that actually use it are re-expanded.
+\newcommand{\term}[1]{\textbf{#1}}
+\newcommand{\engine}{Fermion TeX Engine}
+\newcommand{\half}{\frac{1}{2}}
+
+\begin{document}
+
+\section{Introduction}
+\label{sec:intro}
+
+This document is being typeset by the \engine, a resident incremental
+TeX runtime. Unlike a batch compiler, the engine keeps the entire
+document state alive between keystrokes: the \term{Source DOM}, the
+\term{Semantic DOM}, the dependency graph, the \term{Layout DOM}, the
+\term{Page DOM} and the display lists all stay in memory while you
+edit. Nothing is re-read from disk and no process is restarted.
+
+When you change a single word of this paragraph, the engine marks
+exactly one source node dirty, re-expands and re-parses only that
+block, re-runs line breaking for one paragraph, and patches only the
+pages whose display list actually changed. Try it now: edit any word
+and watch the inspector on the right report the dirty set.
+
+The core claim of this project is simple to state. Given an edit, the
+engine must answer one question precisely: what becomes dirty? The
+answer flows through every layer, from the changed source range down
+to the display commands of a single page, and the inspector shows the
+whole chain for every keystroke.
+
+\section{The DOM Pipeline}
+\label{sec:pipeline}
+
+As explained in Section~\ref{sec:intro}, the engine is not an editor
+and not a wrapper around an existing TeX binary. It is a runtime. The
+source text is segmented into blocks, each block is expanded by the
+macro VM, parsed into a semantic node, laid out into lines, and the
+lines are poured into pages. Every stage caches its result per block
+and every cache records what it depends on.
+
+The pipeline layers are:
+
+\begin{itemize}
+\item Source DOM: blocks with stable identity across edits, diffed by
+  content hash so an unchanged paragraph keeps its caches.
+\item Macro VM: expansion with per-block dependency records, so
+  redefining a macro invalidates exactly its users.
+\item Semantic DOM: sections, paragraphs, lists, math, labels, refs.
+\item Dependency graph: labels, references and counters, used to
+  propagate dirtiness beyond the edited block.
+\item Layout DOM: justified line breaking with real font metrics.
+\item Page DOM: incremental pagination with convergence detection.
+\item Display lists: absolute drawing commands, patched per page.
+\end{itemize}
+
+Inline mathematics is measured and placed by the engine itself, for
+example $E = mc^2$ or $\alpha + \beta \le \gamma$, and participates in
+line breaking as a rigid box. Display equations are blocks of their
+own:
+
+\[
+a^2 + b^2 = c^2
+\]
+
+\[
+f(x) = \half x^2 + \alpha x + \beta
+\]
+
+Because the equation above uses the macro \texttt{half}, redefining
+that macro in the preamble re-typesets exactly one block. The
+dependency graph records the relationship the moment the expansion
+happens, so no global scan is ever needed.
+
+\section{Incremental Pagination}
+\label{sec:pages}
+
+Page breaking is the hardest part of incremental typesetting. A small
+change of paragraph height can shift every following page. The engine
+therefore treats pages as chunks of a stream of line units, where each
+unit is owned by the layout node of its block. Unchanged blocks
+contribute the very same unit objects as in the previous pass, so two
+runs that start a page at the same unit will break all following
+pages identically.
+
+This gives convergence for free: after an edit, pagination is
+recomputed from the stream, but every page whose unit sequence is
+identical to the previous run is adopted wholesale, display list and
+all. The inspector reports how many pages were reused and how many
+were rebuilt, and the patch set contains only pages whose display
+list hash actually changed.
+
+Cross references stress the dependency graph in the other direction.
+This sentence refers to Section~\ref{sec:pipeline} and to
+Section~\ref{sec:intro}; renaming either label makes exactly the
+blocks containing these references dirty, because the graph knows
+which semantic nodes consumed which labels. Deleting a label turns
+the reference into a visible question mark pair, just as in LaTeX.
+
+\subsection{Convergence in practice}
+\label{sec:convergence}
+
+Try inserting a full paragraph near the top of the document. Every
+following line shifts, so the pages after the edit are rebuilt, and
+the inspector shows the pagination cost honestly. Then undo the
+insertion: the stream returns to its previous shape, the reused page
+count jumps back up, and the patch set shrinks to the pages that
+actually changed on screen.
+
+Now try editing this very paragraph instead. The blocks before it are
+untouched, their layout nodes are cache hits, and the pages before
+this one are adopted without regeneration. Only the page containing
+this paragraph, and possibly the one after it, appear in the patch
+list. That asymmetry between where you type and what gets recomputed
+is the whole point of a resident typesetting runtime.
+
+\subsection{What the engine refuses to fake}
+\label{sec:honest}
+
+The preview in this demo is not a bitmap diff and not a reloaded PDF.
+The viewer receives display lists, one per changed page, and redraws
+exactly those pages. The PDF export button serializes the same
+display lists into a real PDF file, which demonstrates that the
+document state is upstream of any particular output format.
+
+The engine also refuses to hide its limits. Unknown commands are
+rendered visibly in typewriter type and reported as diagnostics
+instead of being silently dropped. Unclosed groups are tolerated so
+the runtime survives every intermediate keystroke while you type a
+command name character by character.
+
+\section{Numbers and Counters}
+\label{sec:counters}
+
+Section numbers are computed by the counter pass, and headings whose
+number changed are re-laid-out even when their text did not change.
+Inserting a new section before this one renumbers everything that
+follows, and the dependency report attributes those relayouts to the
+counter, not to the edit itself. References such as the one pointing
+at Section~\ref{sec:convergence} update in the same pass.
+
+The demo ends with a short summary. The engine keeps a living DOM of
+the document, tracks dependencies between macros, labels, counters
+and blocks, lays out only what changed, repaginates only from where
+heights changed, and patches only pages whose drawing commands
+differ. Everything else is reuse, and the inspector proves it on
+every keystroke.
+
+\end{document}

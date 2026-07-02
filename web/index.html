@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fermion TeX Engine — TeX DOM Runtime</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <span class="logo">Ψ</span>
+    <span class="name">Fermion TeX Engine</span>
+    <span class="sub">TeX DOM Runtime — resident incremental typesetting</span>
+  </div>
+  <div class="status" id="status">起動中…</div>
+  <div class="actions">
+    <button id="btn-macro" title="\newcommand{\term} の本体を textbf⇄emph で切り替え、依存ブロックだけが再組版されることを確認">\term 再定義</button>
+    <button id="btn-label" title="\label{sec:intro} を改名して参照が ?? になる依存伝播を確認">label 改名</button>
+    <button id="btn-pdf" title="Display List から PDF を生成">PDF 書き出し</button>
+    <button id="btn-reset" title="サンプル文書に戻す">リセット</button>
+  </div>
+</header>
+
+<main id="layout">
+  <section id="editor-pane">
+    <div class="pane-title">main.tex <span class="hint">編集すると差分だけが再組版されます（クリックで移動: プレビュー→ソース対応あり）</span></div>
+    <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
+  </section>
+
+  <section id="preview-pane">
+    <div class="pane-title">Preview <span class="hint">パッチされたページだけが光ります</span></div>
+    <div id="pages"></div>
+  </section>
+
+  <aside id="inspector-pane">
+    <div class="pane-title">Engine Inspector</div>
+    <div id="inspector">
+      <div class="empty">まだ編集がありません</div>
+    </div>
+  </aside>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

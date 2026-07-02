@@ -1,0 +1,110 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage{tikz}
+
+\newtheorem{theorem}{Theorem}[section]
+\newcommand{\term}[1]{\textbf{#1}}
+\newcommand{\engine}{Fermion TeX Engine}
+
+\begin{document}
+
+\section{Live LuaLaTeX}
+\label{sec:live}
+
+This document is typeset by a \emph{real} Lua\LaTeX{} --- genuine
+Knuth--Plass line breaking, real Latin Modern fonts with ligatures and
+kerning, and the complete \term{amsmath} machinery. The \engine{} keeps
+the document resident: when you edit one sentence, only the block
+containing it is re-typeset by LuaTeX, and only the pages whose display
+list changed are patched in the preview.
+
+Edit any word in this paragraph and watch the inspector: one block
+compiles, every other block is reused from cache, and untouched pages
+survive by reference. Efficient office workflows -- ligatures intact.
+
+\section{Mathematics}
+\label{sec:math}
+
+Inline mathematics like $\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}$
+is typeset by TeX itself, inside the paragraph. Numbered displays work
+with genuine equation counters:
+
+\begin{equation}
+  \label{eq:gauss}
+  \nabla \cdot \mathbf{E} = \frac{\rho}{\varepsilon_0}
+\end{equation}
+
+\begin{align}
+  \label{eq:euler}
+  e^{i\pi} + 1 &= 0, \\
+  \sum_{n=1}^{\infty} \frac{1}{n^2} &= \frac{\pi^2}{6}.
+\end{align}
+
+Equation~\eqref{eq:gauss} is Gauss's law; the pair in~\eqref{eq:euler}
+needs \term{align}. Insert a new numbered equation above them and the
+numbers below renumber through the counter chain --- the engine
+recompiles exactly the blocks whose entry state changed.
+
+\begin{theorem}
+  \label{thm:main}
+  A resident typesetting runtime patches a page if and only if the
+  page's display list hash changes.
+\end{theorem}
+
+Theorem~\ref{thm:main} lives in Section~\ref{sec:math}; its number
+comes from a real \term{amsthm} counter injected per block.
+
+\section{Graphics and Tables}
+\label{sec:graphics}
+
+A TikZ picture is just another block --- edit its coordinates and only
+this block recompiles:
+
+\begin{center}
+\begin{tikzpicture}[scale=1.1]
+  \draw[->, thick] (-0.2,0) -- (3.4,0) node[right] {$x$};
+  \draw[->, thick] (0,-0.2) -- (0,2.2) node[above] {$y$};
+  \draw[blue, very thick, domain=0:1.4, smooth] plot (\x, {\x*\x}) node[right] {$y = x^2$};
+  \draw[red, very thick, domain=0:2.1, smooth, dashed] plot (\x, {sqrt(\x)}) node[right] {$y = \sqrt{x}$};
+  \fill[purple] (1,1) circle (2.2pt) node[above left] {$(1,1)$};
+\end{tikzpicture}
+\end{center}
+
+Tables use \term{booktabs} rules, exactly as lualatex would print them:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Layer & Nodes & Compiled & Reused \\
+\midrule
+Source DOM   & 24 & 1 & 23 \\
+Chunk cache  & 24 & 1 & 23 \\
+Page DOM     & 3  & 1 & 2  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Incrementality}
+\label{sec:inc}
+
+As stated in Section~\ref{sec:live}, the engine is a runtime, not a
+compiler wrapper. Blocks are diffed by content hash; each dirty block
+is typeset in isolation with its entry state (section, equation and
+theorem counters) injected, and its exit state chains into the next
+block. Labels are captured from the real aux stream, so
+\eqref{eq:gauss} and \ref{thm:main} resolve exactly as in a full
+compile.
+
+Renaming a label makes precisely the referencing blocks dirty. A
+whitespace-only edit re-typesets one block, produces a chunk that is
+byte-identical to the cached one, and therefore patches nothing. The
+inspector proves both claims on every keystroke.
+
+Structural changes --- a new package in the preamble, a class option
+--- take the honest path: the preamble format is rebuilt and every
+block recompiles once. Everything else stays live.
+
+\end{document}
