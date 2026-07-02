@@ -1,5 +1,36 @@
 # Fermion TeX Engine — TeX DOM Runtime
 
+A **resident, incremental TeX/LaTeX typesetting runtime**: the engine keeps
+the whole document state alive between keystrokes and turns source diffs into
+display-list patches. With a TeX installation present, typesetting is done by
+**real LuaLaTeX, one block at a time** — sentence and math edits update the
+preview in ~0.4 s while untouched blocks, pages and chunks are reused from
+cache. No TeX installed? It falls back to a built-in zero-dependency engine.
+
+## Quick start
+
+```bash
+git clone https://github.com/heavyinthegame/fermion-tex-engine.git
+cd fermion-tex-engine
+npm start        # no npm install needed — zero dependencies
+# open http://127.0.0.1:4633
+```
+
+Requirements:
+
+- **Node.js 18+** — that's all for the internal engine.
+- **Optional (recommended): TeX Live + poppler** for the real-LuaLaTeX live
+  backend (auto-detected at startup):
+  - macOS: `brew install --cask mactex-no-gui && brew install poppler`
+  - Debian/Ubuntu: `apt install texlive-latex-extra texlive-luatex poppler-utils`
+  - needs `lualatex` and `pdftocairo` on PATH
+- Force a backend with `TDOM_BACKEND=internal npm start` (or `lualatex`).
+
+Run the test suite with `npm test` (the LuaLaTeX integration tests skip
+automatically when no TeX installation is found).
+
+---
+
 TeX / LaTeX互換の入力を受け取り、**文書状態を常駐保持**し、**ソース変更差分から表示差分を生成**する、
 新しいインクリメンタルTeX組版ランタイムです。
 
