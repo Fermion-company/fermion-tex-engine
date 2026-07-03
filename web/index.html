@@ -433,15 +433,22 @@
     <div class="workspace-panel" data-panel="ai">
       <div class="workspace-head"><h2>AI</h2></div>
       <div class="ai-composer">
-        <div class="ai-mode-row" role="group" aria-label="AI補助の種類">
-          <label><input type="radio" name="ai-mode" value="paragraph" checked> 文章</label>
-          <label><input type="radio" name="ai-mode" value="structure"> 構成</label>
-          <label><input type="radio" name="ai-mode" value="sty-integration"> .sty統合</label>
-          <label><input type="radio" name="ai-mode" value="macro-design"> マクロ設計</label>
-          <label><input type="radio" name="ai-mode" value="box-design"> tcolorbox</label>
-          <label><input type="radio" name="ai-mode" value="page-style"> 柱・版面</label>
+        <div class="ai-lanes">
+          <label class="ai-lane is-active" data-ai-lane="body"><input type="radio" name="ai-lane" value="body" checked>本文編集</label>
+          <label class="ai-lane" data-ai-lane="design"><input type="radio" name="ai-lane" value="design">意匠・sty設計</label>
         </div>
-        <div class="insert-grid">
+        <div class="ai-mode-row" role="group" aria-label="本文編集AI">
+          <label data-ai-scope="body"><input type="radio" name="ai-mode" value="paragraph" checked> 文章</label>
+          <label data-ai-scope="body"><input type="radio" name="ai-mode" value="structure"> 構成</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="sty-integration"> .sty統合</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="macro-design"> マクロ設計</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="box-design"> tcolorbox</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="page-style"> 柱・版面</label>
+        </div>
+        <div class="ai-dialog">
+          <div class="ai-message ai-message-assistant" id="ai-assistant-message">本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。</div>
+        </div>
+        <div class="insert-grid ai-body-controls">
           <label>使うコマンド・環境
             <select id="ai-command">
               <option value="auto" selected>内容から選ぶ</option>
@@ -476,63 +483,73 @@
           <button id="ai-draft" type="button">候補を作成</button>
           <button id="ai-insert" type="button" disabled>文書に追加</button>
         </div>
+        <div id="ai-pdf-preview" class="ai-pdf-preview is-hidden" aria-live="polite"></div>
         <div id="ai-result" class="ai-result" aria-live="polite"></div>
       </div>
     </div>
     <div class="workspace-panel" data-panel="code">
       <div class="workspace-head"><h2>コード</h2></div>
-      <div class="code-console">
-        <section class="insert-card">
-          <h3>ファイルを追加</h3>
-          <div class="insert-grid">
-            <label>TeX系ファイル
-              <input id="code-file-input" type="file" accept=".tex,.sty,.cls,.bib,text/plain">
-            </label>
-            <label>扱い
-              <select id="code-file-kind">
-                <option value="auto" selected>拡張子から判断</option>
-                <option value="sty">.styとして読み込む</option>
-                <option value="tex">分割TeXとして挿入</option>
-                <option value="bib">文献DBとして参照</option>
-                <option value="cls">クラスファイルとして保存</option>
-              </select>
-            </label>
-            <label>挿入先
-              <select id="code-file-target">
-                <option value="end" selected>文末</option>
-              </select>
-            </label>
+      <div class="code-workbench">
+        <aside class="code-sidebar">
+          <div class="code-sidebar-head">
+            <span>FILES</span>
+            <button id="code-file-pick" type="button" title="ファイルを選択">＋</button>
           </div>
-          <button id="code-file-integrate" class="primary-action" type="button">選択ファイルを組み込む</button>
-        </section>
-        <section class="insert-card">
-          <h3>部・章ファイルを作成</h3>
-          <div class="insert-grid">
-            <label>見出し
-              <input id="code-split-title" type="text" placeholder="第1章 / 先行研究">
-            </label>
-            <label>保存先
-              <input id="code-split-name" type="text" placeholder="chapters/chapter-1.tex">
-            </label>
-            <label>読み込み
-              <select id="code-split-command">
-                <option value="input" selected>input</option>
-                <option value="include">include</option>
-              </select>
-            </label>
-            <label>挿入先
-              <select id="code-split-target">
-                <option value="end" selected>文末</option>
-              </select>
-            </label>
-          </div>
-          <textarea id="code-split-body" spellcheck="true" placeholder="分割ファイルに入れる本文。空なら見出しだけ作成します。"></textarea>
-          <button id="code-split-create" class="primary-action" type="button">分割ファイルを作成して参照を追加</button>
-        </section>
-        <section class="insert-card code-file-card">
-          <h3>現在の外部ファイル</h3>
+          <input id="code-file-input" class="visually-hidden" type="file" accept=".tex,.sty,.cls,.bib,text/plain">
           <div id="code-file-list" class="code-file-list" aria-live="polite"></div>
-        </section>
+        </aside>
+        <div class="code-main">
+          <section class="code-detail">
+            <div class="code-detail-head">
+              <h3>ファイルを組み込む</h3>
+              <span id="code-picked-file">未選択</span>
+            </div>
+            <div class="insert-grid">
+              <label>扱い
+                <select id="code-file-kind">
+                  <option value="auto" selected>拡張子から判断</option>
+                  <option value="sty">.styとして読み込む</option>
+                  <option value="tex">分割TeXとして挿入</option>
+                  <option value="bib">文献DBとして参照</option>
+                  <option value="cls">クラスファイルとして保存</option>
+                </select>
+              </label>
+              <label>挿入先
+                <select id="code-file-target">
+                  <option value="end" selected>文末</option>
+                </select>
+              </label>
+            </div>
+            <button id="code-file-integrate" class="primary-action" type="button">選択ファイルを組み込む</button>
+          </section>
+          <section class="code-detail">
+            <div class="code-detail-head">
+              <h3>部・章ファイルを作成</h3>
+              <span>大型文書用</span>
+            </div>
+            <div class="insert-grid">
+              <label>見出し
+                <input id="code-split-title" type="text" placeholder="第1章 / 先行研究">
+              </label>
+              <label>保存先
+                <input id="code-split-name" type="text" placeholder="chapters/chapter-1.tex">
+              </label>
+              <label>読み込み
+                <select id="code-split-command">
+                  <option value="input" selected>input</option>
+                  <option value="include">include</option>
+                </select>
+              </label>
+              <label>挿入先
+                <select id="code-split-target">
+                  <option value="end" selected>文末</option>
+                </select>
+              </label>
+            </div>
+            <textarea id="code-split-body" spellcheck="true" placeholder="分割ファイルに入れる本文。空なら見出しだけ作成します。"></textarea>
+            <button id="code-split-create" class="primary-action" type="button">分割ファイルを作成して参照を追加</button>
+          </section>
+        </div>
       </div>
       <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
     </div>

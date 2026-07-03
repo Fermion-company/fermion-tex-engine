@@ -48,6 +48,8 @@ const codeLinesEl = document.getElementById('code-lines');
 const codeBodyEl = document.getElementById('code-body');
 const codeInsertButton = document.getElementById('code-insert');
 const codeFileInputEl = document.getElementById('code-file-input');
+const codeFilePickButton = document.getElementById('code-file-pick');
+const codePickedFileEl = document.getElementById('code-picked-file');
 const codeFileKindEl = document.getElementById('code-file-kind');
 const codeFileTargetEl = document.getElementById('code-file-target');
 const codeFileIntegrateButton = document.getElementById('code-file-integrate');
@@ -69,6 +71,10 @@ const aiTargetEl = document.getElementById('ai-target');
 const aiDraftButton = document.getElementById('ai-draft');
 const aiInsertButton = document.getElementById('ai-insert');
 const aiResultEl = document.getElementById('ai-result');
+const aiPdfPreviewEl = document.getElementById('ai-pdf-preview');
+const aiAssistantMessageEl = document.getElementById('ai-assistant-message');
+const aiLaneInputs = [...document.querySelectorAll('input[name="ai-lane"]')];
+const aiModeLabels = [...document.querySelectorAll('[data-ai-scope]')];
 const tableRowsEl = document.getElementById('table-rows');
 const tableColsEl = document.getElementById('table-cols');
 const tableAlignEl = document.getElementById('table-align');
@@ -586,6 +592,40 @@ function collectExternalFiles(source) {
   return out;
 }
 
+function codeFileIcon(kind, pathText = '') {
+  const ext = String(pathText).split('.').pop()?.toLowerCase();
+  if (kind === '文献DB' || ext === 'bib') return 'BIB';
+  if (kind === '.sty' || ext === 'sty') return 'STY';
+  if (ext === 'cls') return 'CLS';
+  return 'TEX';
+}
+
+function renderCodeFileTree(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const parts = item.path.split('/');
+    const folder = parts.length > 1 ? parts.slice(0, -1).join('/') : 'document';
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push(item);
+  }
+  return [...groups.entries()]
+    .map(([folder, files]) => `
+      <div class="code-folder">
+        <div class="code-folder-name">${escapeHtml(folder)}</div>
+        ${files
+          .map((item) => `
+            <button class="code-file-item ${item.uploaded ? 'is-uploaded' : ''}" type="button" data-code-file-path="${escapeHtml(item.path)}">
+              <span class="code-file-icon">${escapeHtml(codeFileIcon(item.kind, item.path))}</span>
+              <span class="code-file-path">${escapeHtml(item.path.split('/').pop() || item.path)}</span>
+              <span class="code-file-command">${escapeHtml(item.command)}</span>
+            </button>
+          `)
+          .join('')}
+      </div>
+    `)
+    .join('');
+}
+
 function renderCodeFileList(source) {
   if (!codeFileListEl) return;
   const current = collectExternalFiles(source);
@@ -594,21 +634,11 @@ function renderCodeFileList(source) {
     codeFileListEl.innerHTML = '<div class="empty-state">外部ファイル参照はまだありません</div>';
     return;
   }
-  const currentHtml = current.map((item) => `
-    <div class="code-file-item">
-      <span class="code-file-kind">${escapeHtml(item.kind)}</span>
-      <span class="code-file-path">${escapeHtml(item.path)}</span>
-      <span class="code-file-command">${escapeHtml(item.command)}</span>
-    </div>
-  `).join('');
-  const uploadedHtml = uploaded.map((file) => `
-    <div class="code-file-item is-uploaded">
-      <span class="code-file-kind">保存済み</span>
-      <span class="code-file-path">${escapeHtml(file.texPath)}</span>
-      <span class="code-file-command">未参照</span>
-    </div>
-  `).join('');
-  codeFileListEl.innerHTML = currentHtml + uploadedHtml;
+  const items = [
+    ...current.map((item) => ({ ...item, uploaded: false })),
+    ...uploaded.map((file) => ({ kind: '保存済み', path: file.texPath, command: '未参照', uploaded: true })),
+  ];
+  codeFileListEl.innerHTML = renderCodeFileTree(items);
 }
 
 async function loadUploadedTexFiles() {
@@ -1647,9 +1677,73 @@ function selectedAiMode() {
   return document.querySelector('input[name="ai-mode"]:checked')?.value ?? 'paragraph';
 }
 
+function selectedAiLane() {
+  return document.querySelector('input[name="ai-lane"]:checked')?.value ?? 'body';
+}
+
+function aiModeScope(mode) {
+  return ['sty-integration', 'macro-design', 'box-design', 'page-style'].includes(mode) ? 'design' : 'body';
+}
+
+function isAiDesignDraft(draft) {
+  return draft?.aiScope === 'design';
+}
+
+function setAiCommandOptionsForLane(lane) {
+  if (!aiCommandEl) return;
+  const designCommands = new Set(['auto', 'style-package', 'macro', 'tcolorbox', 'page-style']);
+  for (const option of aiCommandEl.options) {
+    option.hidden = lane === 'design' ? !designCommands.has(option.value) : false;
+  }
+  if (aiCommandEl.selectedOptions[0]?.hidden) aiCommandEl.value = 'auto';
+}
+
+function updateAiLaneUi() {
+  const lane = selectedAiLane();
+  document.querySelectorAll('[data-ai-lane]').forEach((label) => {
+    label.classList.toggle('is-active', label.dataset.aiLane === lane);
+  });
+  for (const label of aiModeLabels) {
+    label.hidden = label.dataset.aiScope !== lane;
+  }
+  const checkedMode = selectedAiMode();
+  if (aiModeScope(checkedMode) !== lane) {
+    const first = document.querySelector(`[data-ai-scope="${lane}"] input[name="ai-mode"]`);
+    if (first) first.checked = true;
+  }
+  setAiCommandOptionsForLane(lane);
+  if (aiAssistantMessageEl) {
+    aiAssistantMessageEl.textContent =
+      lane === 'design'
+        ? '持ち込み.sty、独自マクロ、tcolorbox、柱などの意匠案を作り、サンプルを実コンパイルしたPDFで確認します。'
+        : '本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。';
+  }
+  if (aiPromptEl) {
+    aiPromptEl.placeholder =
+      lane === 'design'
+        ? '例: 注意書き用の角丸tcolorboxを作りたい / uploads/my-style.sty を使いたい'
+        : '追加・整理したい本文を入力';
+  }
+}
+
+function switchAiLane(lane) {
+  const laneInput = document.querySelector(`input[name="ai-lane"][value="${lane}"]`);
+  if (laneInput) laneInput.checked = true;
+  const modeInput = document.querySelector(`[data-ai-scope="${lane}"] input[name="ai-mode"]`);
+  if (modeInput) modeInput.checked = true;
+  if (aiCommandEl) aiCommandEl.value = 'auto';
+  aiDraft = null;
+  updateAiLaneUi();
+  renderAiDraft(null);
+}
+
 function selectedAiCommand(mode, prompt) {
   const selected = aiCommandEl?.value || 'auto';
   if (selected !== 'auto') return selected;
+  if (/tcolorbox|box|枠|囲み|注意|コラム/i.test(prompt)) return 'tcolorbox';
+  if (/柱|ヘッダ|ヘッダー|フッタ|フッター|ノンブル|版面|page\s*style/i.test(prompt)) return 'page-style';
+  if (/マクロ|macro|\\newcommand|\\renewcommand|コマンド/i.test(prompt)) return 'macro';
+  if (/\.sty\b|\\usepackage|package|スタイルファイル/i.test(prompt)) return 'style-package';
   if (mode === 'structure') return 'section';
   if (mode === 'sty-integration') return 'style-package';
   if (mode === 'macro-design') return 'macro';
@@ -1669,6 +1763,7 @@ function renderAiDraft(draft) {
     aiResultEl.className = 'ai-result is-empty';
     aiResultEl.textContent = '候補はまだありません';
     aiInsertButton.disabled = true;
+    renderAiPdfPreview(null);
     return;
   }
   aiResultEl.className = 'ai-result';
@@ -1677,6 +1772,60 @@ function renderAiDraft(draft) {
     <div class="ai-result-body">${escapeHtml(draft.preview)}</div>
   `;
   aiInsertButton.disabled = false;
+}
+
+function renderAiPdfPreview(state) {
+  if (!aiPdfPreviewEl) return;
+  if (!state) {
+    aiPdfPreviewEl.className = 'ai-pdf-preview is-hidden';
+    aiPdfPreviewEl.innerHTML = '';
+    return;
+  }
+  aiPdfPreviewEl.className = `ai-pdf-preview ${state.error ? 'has-error' : ''}`;
+  if (state.loading) {
+    aiPdfPreviewEl.innerHTML = '<div class="ai-preview-status">LuaLaTeXでPDFプレビューを作成中…</div>';
+    return;
+  }
+  if (state.error) {
+    aiPdfPreviewEl.innerHTML = `
+      <div class="ai-preview-status">PDFプレビューを作成できませんでした</div>
+      <pre>${escapeHtml(state.error)}</pre>
+    `;
+    return;
+  }
+  aiPdfPreviewEl.innerHTML = `
+    <div class="ai-preview-status">実コンパイルPDFプレビュー</div>
+    <iframe title="AI style PDF preview" src="${escapeHtml(state.url)}"></iframe>
+  `;
+}
+
+function sourceWithAiDraft(source, draft) {
+  let out = source;
+  for (const packageName of draft.packages ?? []) out = ensurePackage(out, packageName);
+  if (draft.theoremEnvs?.length) out = ensureTheoremEnvironments(out, draft.theoremEnvs);
+  if (draft.preambleTex) out = insertPreambleSnippet(out, draft.preambleTex);
+  const sample = draft.tex || draft.previewTex || '\n\\section{AI Style Preview}\nこの文書の意匠プレビューです。\n';
+  return sample ? insertTexAtTarget(out, sample, 'end') : out;
+}
+
+async function compileAiPdfPreview(draft) {
+  if (!isAiDesignDraft(draft)) {
+    renderAiPdfPreview(null);
+    return;
+  }
+  renderAiPdfPreview({ loading: true });
+  try {
+    const res = await fetch('/ai-preview', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: sourceWithAiDraft(editor.value, draft) }),
+    });
+    const payload = await res.json();
+    if (!res.ok || payload.error) throw new Error(payload.error || `HTTP ${res.status}`);
+    renderAiPdfPreview({ url: payload.url });
+  } catch (err) {
+    renderAiPdfPreview({ error: err.message || String(err) });
+  }
 }
 
 function buildAiDraft(mode, prompt) {
@@ -1695,6 +1844,11 @@ function buildAiDraft(mode, prompt) {
       tex: '',
       packages: [packageName],
       preambleOnly: true,
+      aiScope: 'design',
+      previewTex:
+        '\n\\section{Style Preview}\n' +
+        'このページは持ち込みスタイルを読み込んだ状態のサンプルです。\n\n' +
+        '\\begin{itemize}\n  \\item 見出し、本文、箇条書きの見え方\n  \\item 数式 $E=mc^2$ と参照用テキスト\n\\end{itemize}\n',
     };
   }
   if (command === 'macro') {
@@ -1708,6 +1862,7 @@ function buildAiDraft(mode, prompt) {
       preambleTex: `\\newcommand{\\${name}}${args}{${body}}`,
       tex: argCount === 0 ? `\n\\${name}\n` : argCount === 2 ? `\n\\${name}{${escapeLatexText(title)}}{${escapeLatexText(text)}}\n` : `\n\\${name}{${escapeLatexText(title)}}\n`,
       packages: [],
+      aiScope: 'design',
     };
   }
   if (command === 'tcolorbox') {
@@ -1720,6 +1875,7 @@ function buildAiDraft(mode, prompt) {
         `\\newtcolorbox{${envName}}[1][]{enhanced,breakable,colback=blue!3,colframe=blue!55!black,boxrule=0.7pt,arc=2pt,left=8pt,right=8pt,top=7pt,bottom=7pt,fonttitle=\\bfseries,title=#1}`,
       tex: `\n\\begin{${envName}}[${escapeLatexText(title)}]\n${escapeLatexText(text)}\n\\end{${envName}}\n`,
       packages: ['tcolorbox'],
+      aiScope: 'design',
     };
   }
   if (command === 'page-style') {
@@ -1738,6 +1894,12 @@ function buildAiDraft(mode, prompt) {
       tex: '',
       packages: ['fancyhdr'],
       preambleOnly: true,
+      aiScope: 'design',
+      previewTex:
+        '\n\\section{Page Style Preview}\n' +
+        '柱、ノンブル、本文領域の見え方を確認するためのサンプルです。\n\n' +
+        '本文が複数ページに流れたときの余白とヘッダーを確認します。\n\\newpage\n' +
+        '\\section{Second Page}\n二ページ目の柱とノンブルを確認します。\n',
     };
   }
   if (command === 'section' || command === 'subsection') {
@@ -1900,7 +2062,9 @@ function macroNameFromPrompt(text) {
 function environmentNameFromPrompt(text, fallback) {
   const env = String(text || '').match(/\\begin\{([A-Za-z][A-Za-z0-9*_-]*)\}/);
   if (env) return env[1].replace(/[^A-Za-z0-9]/g, '');
-  return identifierFromText(text, fallback);
+  const name = identifierFromText(text, fallback);
+  if (['tcolorbox', 'box', 'document'].includes(name.toLowerCase())) return fallback;
+  return name;
 }
 
 function insertAiDraft() {
@@ -1917,13 +2081,24 @@ function insertAiDraft() {
   setWorkspaceMode('edit');
 }
 
-aiDraftButton?.addEventListener('click', () => {
+aiDraftButton?.addEventListener('click', async () => {
   aiDraft = buildAiDraft(selectedAiMode(), aiPromptEl.value);
   renderAiDraft(aiDraft);
+  await compileAiPdfPreview(aiDraft);
 });
 
 aiInsertButton?.addEventListener('click', insertAiDraft);
+aiLaneInputs.forEach((input) => input.addEventListener('change', () => switchAiLane(input.value)));
+document.querySelectorAll('input[name="ai-mode"]').forEach((input) => {
+  input.addEventListener('change', () => {
+    const scope = aiModeScope(input.value);
+    const laneInput = document.querySelector(`input[name="ai-lane"][value="${scope}"]`);
+    if (laneInput) laneInput.checked = true;
+    updateAiLaneUi();
+  });
+});
 
+updateAiLaneUi();
 renderAiDraft(null);
 
 // ---------------------------------------------------------------- insert builder
@@ -2543,6 +2718,16 @@ async function createSplitTexFile() {
 
 codeFileIntegrateButton?.addEventListener('click', integrateSelectedCodeFile);
 codeSplitCreateButton?.addEventListener('click', createSplitTexFile);
+codeFilePickButton?.addEventListener('click', () => codeFileInputEl?.click());
+codeFileInputEl?.addEventListener('change', () => {
+  const file = codeFileInputEl.files?.[0];
+  if (codePickedFileEl) codePickedFileEl.textContent = file ? file.name : '未選択';
+});
+codeFileListEl?.addEventListener('click', (ev) => {
+  const item = ev.target.closest?.('[data-code-file-path]');
+  if (!item || !codePickedFileEl) return;
+  codePickedFileEl.textContent = item.dataset.codeFilePath || '未選択';
+});
 
 async function insertImageFigure() {
   const file = imageFileEl?.files?.[0];

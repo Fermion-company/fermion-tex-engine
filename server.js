@@ -12,9 +12,12 @@
 // display-list patches (from the POST response and/or the SSE stream).
 
 import http from 'node:http';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { TDOMEngine } from './engine/engine.js';
 import { LuaTDOMEngine } from './engine/engine-lua.js';
 import { LuaTexBackend } from './engine/luatex/backend.js';
@@ -27,6 +30,8 @@ const PORT = Number(process.env.PORT || 4633);
 const TEMPLATES_DIR = path.join(ROOT, 'templates');
 const CUSTOM_TEMPLATES_DIR = path.join(TEMPLATES_DIR, 'custom');
 const UPLOADS_DIR = path.join(ROOT, 'samples', 'uploads');
+const AI_PREVIEWS_DIR = path.join(ROOT, '.ai-previews');
+const execFileP = promisify(execFile);
 
 function templateFiles() {
   const out = [];
@@ -209,6 +214,69 @@ function listUploadedTexFiles() {
   return out;
 }
 
+function previewId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function texErrorExcerpt(log) {
+  const lines = String(log || '').split(/\r?\n/);
+  const start = lines.findIndex((line) => /^! /.test(line));
+  if (start >= 0) return lines.slice(start, start + 8).join('\n');
+  return lines.slice(-18).join('\n');
+}
+
+function serveAiPreview(res, name) {
+  try {
+    if (!/^[a-z0-9-]+\.pdf$/i.test(name)) throw new Error('bad preview name');
+    const file = path.resolve(AI_PREVIEWS_DIR, name);
+    if (!file.startsWith(AI_PREVIEWS_DIR + path.sep)) throw new Error('bad preview path');
+    const body = readFileSync(file);
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Cache-Control': 'no-cache',
+      'Content-Disposition': 'inline; filename="ai-style-preview.pdf"',
+    });
+    res.end(body);
+  } catch {
+    res.writeHead(404);
+    res.end('not found');
+  }
+}
+
+async function compilePreviewPdf(source) {
+  const body = String(source || '');
+  if (!body.trim()) throw new Error('preview source is empty');
+  if (body.length > 1_000_000) throw new Error('preview source is too large');
+  mkdirSync(AI_PREVIEWS_DIR, { recursive: true });
+  const work = mkdtempSync(path.join(tmpdir(), 'fermion-ai-preview-'));
+  try {
+    const tex = path.join(work, 'preview.tex');
+    writeFileSync(tex, body.replace(/\r\n?/g, '\n'), 'utf8');
+    try {
+      await execFileP('lualatex', ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', work, tex], {
+        cwd: path.join(ROOT, 'samples'),
+        timeout: 60_000,
+        env: {
+          ...process.env,
+          TEXINPUTS: `${path.join(ROOT, 'samples')}//:${ROOT}//:${process.env.TEXINPUTS || ''}`,
+          LUAINPUTS: `${path.join(ROOT, 'samples')}//:${ROOT}//:${process.env.LUAINPUTS || ''}`,
+        },
+      });
+    } catch (err) {
+      const log = existsSync(path.join(work, 'preview.log')) ? readFileSync(path.join(work, 'preview.log'), 'utf8') : err.stderr || err.stdout || err.message;
+      throw new Error(texErrorExcerpt(log));
+    }
+    const pdf = path.join(work, 'preview.pdf');
+    if (!existsSync(pdf)) throw new Error('preview compile produced no PDF');
+    const id = previewId();
+    const dest = path.join(AI_PREVIEWS_DIR, `${id}.pdf`);
+    writeFileSync(dest, readFileSync(pdf));
+    return { id, url: `/ai-preview/${id}.pdf` };
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
 async function createEngine() {
   const pref = process.env.TDOM_BACKEND;
   const texAvailable = await LuaTexBackend.detect();
@@ -372,6 +440,14 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const saved = saveUploadedTexFile(body);
       return json(res, saved, 201);
+    }
+    if (req.method === 'POST' && url.pathname === '/ai-preview') {
+      const body = JSON.parse(await readBody(req));
+      const preview = await compilePreviewPdf(body.source);
+      return json(res, preview, 201);
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/ai-preview/')) {
+      return serveAiPreview(res, decodeURIComponent(url.pathname.slice('/ai-preview/'.length)));
     }
     if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
       return serveAsset(res, decodeURIComponent(url.pathname.slice('/assets/'.length)));

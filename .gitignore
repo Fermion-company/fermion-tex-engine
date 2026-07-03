@@ -2,5 +2,6 @@
 .tdom-v3*/
 .tdom-dbg/
 .tdom-iso/
+.ai-previews/
 node_modules/
 recovered-document.tex
