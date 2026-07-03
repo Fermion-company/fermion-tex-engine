@@ -93,9 +93,9 @@ body {
 .actions > * {
   flex: 0 0 auto;
 }
+.topbar-menu-toggle,
 .actions select,
-.actions button,
-.split-readout {
+.actions button {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -103,6 +103,11 @@ body {
   min-height: 30px;
   padding: 6px 9px;
   font-size: 12px;
+}
+.topbar-menu-toggle {
+  flex: 0 0 auto;
+  cursor: pointer;
+  white-space: nowrap;
 }
 .actions select {
   cursor: pointer;
@@ -113,16 +118,8 @@ body {
   cursor: pointer;
   white-space: nowrap;
 }
+.topbar-menu-toggle:hover,
 .actions button:hover { border-color: var(--accent); color: var(--accent); }
-.split-readout {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 62px;
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-  user-select: none;
-}
 
 #topbar { flex: none; }
 
@@ -1788,6 +1785,12 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   display: grid;
   gap: 4px;
   min-width: 0;
+}
+.boxedit .boxmath-inline-text .boxmath-textarea {
+  min-height: 42px;
+  max-height: 140px;
+  background: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
 }
 .boxedit .boxmath-line {
   position: relative;

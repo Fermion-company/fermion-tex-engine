@@ -16,7 +16,6 @@ const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const menuToggleButton = document.getElementById('menu-toggle');
 const layoutViewEl = document.getElementById('layout-view');
-const splitReadoutEl = document.getElementById('split-readout');
 const layoutSplitterEl = document.getElementById('workspace-preview-splitter');
 const layoutEl = document.getElementById('layout');
 const editorPaneEl = document.getElementById('editor-pane');
@@ -170,7 +169,6 @@ function applySplitRatio(value = splitRatio) {
   const { workspacePx, previewPx } = splitColumnWidths(workspace);
   document.documentElement.style.setProperty('--workspace-width', `${workspacePx}px`);
   document.documentElement.style.setProperty('--preview-width', `${previewPx}px`);
-  if (splitReadoutEl) splitReadoutEl.textContent = `${Math.round(workspace)} / ${Math.round(100 - workspace)}`;
   layoutSplitterEl?.setAttribute('aria-valuenow', String(Math.round(workspace)));
 }
 
@@ -5346,9 +5344,31 @@ function createInlineMathBlockEditor(source) {
   mathLabel.textContent = lenses.length === 1 ? 'インライン数式' : `インライン数式 ${lenses.length}件`;
   root.appendChild(mathLabel);
 
+  const textareas = [];
   const mathfields = [];
   let activeMathfield = null;
+  let cursor = 0;
+
+  function appendTextSegment(value, index) {
+    const textRow = document.createElement('label');
+    textRow.className = 'boxmath-textrow boxmath-inline-text';
+    const textLabel = document.createElement('span');
+    textLabel.className = 'boxmath-label';
+    textLabel.textContent = index === 0 ? '前の本文' : index === lenses.length ? '後の本文' : '間の本文';
+    const textarea = document.createElement('textarea');
+    textarea.className = 'boxmath-textarea';
+    textarea.value = value;
+    textarea.spellcheck = true;
+    textarea.addEventListener('input', () => autosizeMathTextArea(textarea));
+    textRow.appendChild(textLabel);
+    textRow.appendChild(textarea);
+    root.appendChild(textRow);
+    textareas.push(textarea);
+    autosizeMathTextArea(textarea);
+  }
+
   lenses.forEach((lens, index) => {
+    appendTextSegment(source.slice(cursor, lens.outerStart), index);
     const row = document.createElement('div');
     row.className = 'boxmath-inline-row';
     if (lenses.length > 1) {
@@ -5370,7 +5390,9 @@ function createInlineMathBlockEditor(source) {
     });
     configureMathField(mathfield);
     writeMathFieldValue(mathfield, lens.math.trim());
+    cursor = lens.outerEnd;
   });
+  appendTextSegment(source.slice(cursor), lenses.length);
 
   activeMathfield = mathfields[0] ?? null;
   const keyboard = createMathKeyboardPanel(() => activeMathfield ?? mathfields[0] ?? null);
@@ -5379,8 +5401,19 @@ function createInlineMathBlockEditor(source) {
   return {
     kind: 'math',
     el: root,
-    value: () => rebuildInlineMathBlock(source, lenses, mathfields.map((mathfield) => readMathFieldValue(mathfield).trim())),
+    value: () =>
+      rebuildInlineMathBlockFromControls(
+        lenses,
+        textareas.map((textarea) => textarea.value),
+        mathfields.map((mathfield) => readMathFieldValue(mathfield).trim())
+      ),
     focus: () => {
+      const firstText = textareas.find((textarea) => textarea.value.trim()) ?? textareas[0];
+      if (firstText) {
+        firstText.focus();
+        firstText.setSelectionRange(0, 0);
+        return;
+      }
       const mathfield = mathfields[0];
       activeMathfield = mathfield;
       mathfield?.focus();
@@ -5388,7 +5421,9 @@ function createInlineMathBlockEditor(source) {
         mathfield.executeCommand('moveToMathfieldEnd');
       }
     },
-    grow: () => {},
+    grow: () => {
+      for (const textarea of textareas) autosizeMathTextArea(textarea);
+    },
     destroy: () => keyboard.destroy(),
   };
 }
@@ -5929,8 +5964,10 @@ function parseInlineMathLenses(source) {
             kind: 'inline',
             begin: '\\(',
             end: '\\)',
+            outerStart: i,
             contentStart,
             contentEnd: end,
+            outerEnd: end + 2,
             math: source.slice(contentStart, end),
           });
           i = end + 1;
@@ -5948,8 +5985,10 @@ function parseInlineMathLenses(source) {
           kind: 'inline',
           begin: '$',
           end: '$',
+          outerStart: i,
           contentStart,
           contentEnd: end,
+          outerEnd: end + 1,
           math: source.slice(contentStart, end),
         });
         i = end;
@@ -5989,15 +6028,15 @@ function isEscapedTexChar(source, index) {
   return slashes % 2 === 1;
 }
 
-function rebuildInlineMathBlock(source, lenses, values) {
+function rebuildInlineMathBlockFromControls(lenses, textSegments, mathValues) {
   let out = '';
-  let cursor = 0;
   lenses.forEach((lens, index) => {
-    out += source.slice(cursor, lens.contentStart);
-    out += normalizeMathRowValue(values[index] ?? lens.math, lens).trim();
-    cursor = lens.contentEnd;
+    out += textSegments[index] ?? '';
+    out += lens.begin;
+    out += normalizeMathRowValue(mathValues[index] ?? lens.math, lens).trim();
+    out += lens.end;
   });
-  return out + source.slice(cursor);
+  return out + (textSegments[lenses.length] ?? '');
 }
 
 function parseMathLens(source) {
