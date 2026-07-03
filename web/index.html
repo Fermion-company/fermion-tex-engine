@@ -32,7 +32,14 @@
   </section>
 
   <section id="preview-pane">
-    <div class="pane-title">Preview <span class="hint">パッチされたページだけが光ります</span></div>
+    <div class="pane-title">Preview <span class="hint">パッチされたページだけが光ります</span>
+      <span class="zoomctl">
+        <button id="zoom-out" title="縮小 (⌘/Ctrl+ホイールでも)">−</button>
+        <span id="zoom-level">100%</span>
+        <button id="zoom-in" title="拡大 (⌘/Ctrl+ホイールでも)">＋</button>
+        <button id="zoom-fit" title="幅に合わせる">合わせる</button>
+      </span>
+    </div>
     <div id="pages"></div>
   </section>
 

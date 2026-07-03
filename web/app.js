@@ -309,6 +309,35 @@ function lineColToOffset(text, line, col) {
 
 // ---------------------------------------------------------------- buttons
 
+// ---------------------------------------------------------------- zoom
+
+let zoom = Number(localStorage.getItem('tdom-zoom')) || 1;
+
+function setZoom(z) {
+  zoom = Math.min(3, Math.max(0.4, Math.round(z * 20) / 20));
+  pagesEl.style.setProperty('--zoom', zoom);
+  document.getElementById('zoom-level').textContent = Math.round(zoom * 100) + '%';
+  localStorage.setItem('tdom-zoom', String(zoom));
+}
+
+document.getElementById('zoom-in').addEventListener('click', () => setZoom(zoom * 1.15));
+document.getElementById('zoom-out').addEventListener('click', () => setZoom(zoom / 1.15));
+document.getElementById('zoom-fit').addEventListener('click', () => setZoom(1));
+
+// PDF-viewer convention: Ctrl/Cmd + wheel (and trackpad pinch, which the
+// browser reports as a ctrlKey wheel) zooms the document.
+pagesEl.addEventListener(
+  'wheel',
+  (ev) => {
+    if (!ev.ctrlKey && !ev.metaKey) return;
+    ev.preventDefault();
+    setZoom(zoom * (ev.deltaY < 0 ? 1.08 : 1 / 1.08));
+  },
+  { passive: false }
+);
+
+setZoom(zoom);
+
 // Template picker: start a fresh document from templates/*.tex
 async function loadTemplateList() {
   try {

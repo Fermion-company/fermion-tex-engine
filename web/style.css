@@ -115,20 +115,47 @@ section, aside { min-width: 0; display: flex; flex-direction: column; }
 
 #preview-pane { background: #262b38; border-right: 1px solid var(--border); }
 #pages {
+  --zoom: 1;
   flex: 1;
-  overflow-y: auto;
-  padding: 22px 0 40px;
+  overflow: auto;
+  padding: 22px 16px 40px;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: safe center;
   gap: 22px;
 }
 .page {
   position: relative;
-  width: min(92%, 640px);
+  width: min(calc(92% * var(--zoom)), calc(640px * var(--zoom)));
+  flex: none;
   background: #fff;
   box-shadow: var(--page-shadow);
   border-radius: 2px;
+}
+.zoomctl {
+  float: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.zoomctl button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.zoomctl button:hover { border-color: var(--accent); color: var(--accent); }
+#zoom-level {
+  min-width: 42px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
 }
 .page svg { display: block; width: 100%; height: auto; }
 .page .sheet { position: relative; width: 100%; overflow: hidden; }
