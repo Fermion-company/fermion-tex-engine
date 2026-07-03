@@ -81,16 +81,15 @@ body {
   gap: 4px;
   min-width: 0;
   max-width: min(560px, 58vw);
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: thin;
+  overflow: visible;
 }
 .actions > * {
   flex: 0 0 auto;
 }
 .topbar-menu-toggle,
 .actions select,
-.actions button {
+.actions button,
+.topbar-select-button {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -110,13 +109,75 @@ body {
   cursor: pointer;
   max-width: 136px;
 }
+.actions select[data-topbar-enhanced="true"] {
+  display: none;
+}
 .actions select:hover { border-color: var(--accent); }
 .actions button {
   cursor: pointer;
   white-space: nowrap;
 }
 .topbar-menu-toggle:hover,
-.actions button:hover { border-color: var(--accent); color: var(--accent); }
+.actions button:hover,
+.topbar-select-button:hover { border-color: var(--accent); color: var(--accent); }
+.topbar-select {
+  position: relative;
+  flex: 0 0 auto;
+}
+.topbar-select-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  min-width: 96px;
+  max-width: 142px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.topbar-select-button::after {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--dim);
+}
+.topbar-select-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 168px;
+  max-width: min(280px, calc(100vw - 20px));
+  max-height: min(320px, calc(100vh - 64px));
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid #3a455e;
+  border-radius: 7px;
+  background: #171c27;
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.38);
+}
+.topbar-select-menu[hidden] {
+  display: none;
+}
+.topbar-select-item {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font: 12px/1.2 "Hiragino Sans", "Noto Sans JP", -apple-system, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+.topbar-select-item:hover,
+.topbar-select-item[aria-selected="true"] {
+  background: #233146;
+  color: #e8f6ff;
+}
 
 #topbar { flex: none; }
 

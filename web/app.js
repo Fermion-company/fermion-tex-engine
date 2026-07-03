@@ -16,6 +16,7 @@ const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const menuToggleButton = document.getElementById('menu-toggle');
 const layoutViewEl = document.getElementById('layout-view');
+const templateSelectEl = document.getElementById('tpl-select');
 const layoutSplitterEl = document.getElementById('workspace-preview-splitter');
 const layoutEl = document.getElementById('layout');
 const editorPaneEl = document.getElementById('editor-pane');
@@ -251,6 +252,96 @@ function syncEditorHighlight() {
   editorHighlightEl.scrollTop = editor.scrollTop;
   editorHighlightEl.scrollLeft = editor.scrollLeft;
 }
+
+const topbarSelectMenus = new Map();
+
+function enhanceTopbarSelect(select) {
+  if (!select || topbarSelectMenus.has(select)) return;
+  select.dataset.topbarEnhanced = 'true';
+  select.tabIndex = -1;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'topbar-select';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'topbar-select-button';
+  button.setAttribute('aria-haspopup', 'listbox');
+  button.setAttribute('aria-expanded', 'false');
+  button.title = select.title || '';
+  const menu = document.createElement('div');
+  menu.className = 'topbar-select-menu';
+  menu.setAttribute('role', 'listbox');
+  menu.hidden = true;
+
+  wrap.appendChild(button);
+  wrap.appendChild(menu);
+  select.after(wrap);
+
+  const state = { wrap, button, menu };
+  topbarSelectMenus.set(select, state);
+
+  function close() {
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+  }
+
+  function render() {
+    const selected = select.selectedOptions?.[0] ?? select.options[select.selectedIndex] ?? select.options[0];
+    button.textContent = selected?.textContent || select.title || '選択';
+    menu.textContent = '';
+    for (const option of select.options) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'topbar-select-item';
+      item.textContent = option.textContent;
+      item.dataset.value = option.value;
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', option.selected ? 'true' : 'false');
+      item.disabled = option.disabled;
+      item.addEventListener('click', () => {
+        if (option.value === select.value && select.id !== 'tpl-select') {
+          close();
+          return;
+        }
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        render();
+        close();
+      });
+      menu.appendChild(item);
+    }
+  }
+
+  button.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    for (const other of topbarSelectMenus.values()) {
+      if (other !== state) {
+        other.menu.hidden = true;
+        other.button.setAttribute('aria-expanded', 'false');
+      }
+    }
+    const nextHidden = !menu.hidden;
+    menu.hidden = nextHidden;
+    button.setAttribute('aria-expanded', nextHidden ? 'false' : 'true');
+  });
+  select.addEventListener('change', render);
+  new MutationObserver(render).observe(select, { childList: true, subtree: true, attributes: true });
+  render();
+}
+
+document.addEventListener('click', () => {
+  for (const state of topbarSelectMenus.values()) {
+    state.menu.hidden = true;
+    state.button.setAttribute('aria-expanded', 'false');
+  }
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  for (const state of topbarSelectMenus.values()) {
+    state.menu.hidden = true;
+    state.button.setAttribute('aria-expanded', 'false');
+  }
+});
 let selectedTableCell = { row: 0, col: 0 };
 let drawMode = '2d';
 let drawTool = 'line';
@@ -1784,6 +1875,8 @@ layoutViewEl?.addEventListener('change', () => {
   applyLayoutView(layoutViewEl.value);
   applySplitRatio();
 });
+enhanceTopbarSelect(layoutViewEl);
+enhanceTopbarSelect(templateSelectEl);
 layoutSplitterEl?.addEventListener('pointerdown', beginLayoutResize);
 layoutSplitterEl?.addEventListener('keydown', (ev) => {
   if (ev.key === 'ArrowLeft') {
@@ -6225,11 +6318,12 @@ function placeBoxEdit(wrap, rect) {
 async function loadTemplateList(selectedId = '') {
   try {
     const list = await fetch('/templates').then((r) => r.json());
-    const sel = document.getElementById('tpl-select');
+    const sel = templateSelectEl;
+    if (!sel) return;
     sel.textContent = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = 'テンプレート…';
+    placeholder.textContent = 'テンプレート';
     sel.appendChild(placeholder);
     for (const t of list) {
       const opt = document.createElement('option');
@@ -6248,7 +6342,7 @@ async function loadTemplateList(selectedId = '') {
   }
 }
 
-document.getElementById('tpl-select').addEventListener('change', async (ev) => {
+templateSelectEl?.addEventListener('change', async (ev) => {
   const id = ev.target.value;
   ev.target.value = '';
   if (!id) return;
