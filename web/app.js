@@ -251,6 +251,7 @@ function flushSync() {
       serverText = current;
       const rtt = performance.now() - t0;
       applyReport(report);
+      repositionBox();
       renderInspector(report, rtt);
       const engineMs =
         backend === 'checkpoint'
@@ -280,19 +281,25 @@ editor.addEventListener('input', () => {
   if (!composing) scheduleSync();
 });
 
-// Preview -> source mapping: click any element to jump to its source block.
+// Preview interactions:
+//   click     -> PowerPoint-style box editing right on the page
+//   Alt+click -> jump to the source in the left editor (legacy behavior)
 pagesEl.addEventListener('click', async (ev) => {
-  const src = ev.target?.dataset?.src ?? ev.target.closest?.('[data-src]')?.dataset?.src;
-  if (!src || src === '_footer') return;
-  const dom = await fetch('/dom').then((r) => r.json());
-  const block = dom.blocks.find((b) => b.id === src);
-  if (!block) return;
-  const offset = lineColToOffset(editor.value, block.source.start.line, block.source.start.column);
-  editor.focus();
-  editor.setSelectionRange(offset, offset);
-  const lineTop = editor.value.slice(0, offset).split('\n').length - 1;
-  editor.scrollTop = Math.max(0, lineTop * 19 - editor.clientHeight / 2);
-  statusEl.textContent = `ソース対応: ${src} → main.tex:${block.source.start.line} (${block.type})`;
+  const src = srcOf(ev.target);
+  if (!src) return;
+  if (ev.altKey) {
+    const dom = await fetch('/dom').then((r) => r.json());
+    const block = dom.blocks.find((b) => b.id === src);
+    if (!block) return;
+    const offset = lineColToOffset(editor.value, block.source.start.line, block.source.start.column);
+    editor.focus();
+    editor.setSelectionRange(offset, offset);
+    const lineTop = editor.value.slice(0, offset).split('\n').length - 1;
+    editor.scrollTop = Math.max(0, lineTop * 19 - editor.clientHeight / 2);
+    statusEl.textContent = `ソース対応: ${src} → main.tex:${block.source.start.line} (${block.type})`;
+    return;
+  }
+  openBox(src);
 });
 
 function lineColToOffset(text, line, col) {
@@ -337,6 +344,161 @@ pagesEl.addEventListener(
 );
 
 setZoom(zoom);
+
+
+// ------------------------------------------------- PPT-style box editing
+//
+// Every block (paragraph, heading, equation, caption...) is an editable
+// region: hovering outlines it, clicking opens an overlay editor holding
+// exactly that block's source slice. Each keystroke rebuilds the main
+// buffer and rides the normal 40ms edit pipeline, so the page reflows
+// around the box as you type.
+
+const hoverBox = document.createElement('div');
+hoverBox.id = 'hoverbox';
+let boxState = null; // {src, start, len, wrap, ta, pageDiv, closing}
+let boxComposing = false;
+
+function srcOf(target) {
+  const src = target?.dataset?.src ?? target?.closest?.('[data-src]')?.dataset?.src;
+  if (!src || src.startsWith('_')) return null;
+  return src;
+}
+
+function blockRect(pageDiv, src) {
+  const els = pageDiv.querySelectorAll(`[data-src="${src}"]`);
+  if (!els.length) return null;
+  const p = pageDiv.getBoundingClientRect();
+  let l = Infinity, t = Infinity, r = -Infinity, b = -Infinity;
+  for (const el of els) {
+    const q = el.getBoundingClientRect();
+    if (q.width === 0 && q.height === 0) continue;
+    l = Math.min(l, q.left); t = Math.min(t, q.top);
+    r = Math.max(r, q.right); b = Math.max(b, q.bottom);
+  }
+  if (!isFinite(l)) return null;
+  const pad = 5;
+  return {
+    left: ((l - p.left - pad) / p.width) * 100,
+    top: ((t - p.top - pad) / p.height) * 100,
+    width: ((r - l + 2 * pad) / p.width) * 100,
+    height: ((b - t + 2 * pad) / p.height) * 100,
+  };
+}
+
+pagesEl.addEventListener('mousemove', (ev) => {
+  if (boxState) return;
+  const src = srcOf(ev.target);
+  const pageDiv = ev.target?.closest?.('.page');
+  if (!src || !pageDiv) { hoverBox.style.display = 'none'; return; }
+  const rect = blockRect(pageDiv, src);
+  if (!rect) { hoverBox.style.display = 'none'; return; }
+  if (hoverBox.parentElement !== pageDiv) pageDiv.appendChild(hoverBox);
+  Object.assign(hoverBox.style, {
+    display: 'block',
+    left: rect.left + '%',
+    top: rect.top + '%',
+    width: rect.width + '%',
+    height: rect.height + '%',
+  });
+});
+pagesEl.addEventListener('mouseleave', () => { if (!boxState) hoverBox.style.display = 'none'; });
+
+async function openBox(src) {
+  closeBox();
+  const dom = await fetch('/dom').then((r) => r.json());
+  const block = dom.blocks.find((b) => b.id === src);
+  if (!block) return;
+  if (block.file || !block.span) {
+    statusEl.textContent = 'このブロックは \\input ファイル由来のため、ここでは編集できません';
+    return;
+  }
+  const pageDiv = [...document.querySelectorAll('.page')].find((d) =>
+    d.querySelector(`[data-src="${src}"]`)
+  );
+  if (!pageDiv) return;
+  const rect = blockRect(pageDiv, src);
+  if (!rect) return;
+  hoverBox.style.display = 'none';
+
+  const start = block.span.start;
+  const slice = editor.value.slice(start, block.span.end);
+  const wrap = document.createElement('div');
+  wrap.className = 'boxedit';
+  Object.assign(wrap.style, {
+    left: rect.left + '%',
+    top: rect.top + '%',
+    width: Math.max(rect.width, 24) + '%',
+  });
+  const ta = document.createElement('textarea');
+  ta.value = slice;
+  ta.spellcheck = false;
+  const hint = document.createElement('div');
+  hint.className = 'boxhint';
+  hint.textContent = 'Esc / 枠外クリックで確定';
+  wrap.appendChild(ta);
+  wrap.appendChild(hint);
+  wrap.addEventListener('mousedown', (ev) => ev.stopPropagation());
+  wrap.addEventListener('click', (ev) => ev.stopPropagation());
+  pageDiv.appendChild(wrap);
+
+  boxState = { src, start, len: slice.length, wrap, ta, pageDiv, closing: null };
+  const grow = () => {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight + 2, 420) + 'px';
+  };
+  grow();
+  ta.focus();
+  ta.setSelectionRange(0, 0);
+
+  ta.addEventListener('compositionstart', () => (boxComposing = true));
+  ta.addEventListener('compositionend', () => { boxComposing = false; onBoxInput(); });
+  ta.addEventListener('input', () => { grow(); if (!boxComposing) onBoxInput(); });
+  ta.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { ev.preventDefault(); closeBox(); }
+  });
+  ta.addEventListener('blur', () => {
+    boxState && (boxState.closing = setTimeout(closeBox, 140));
+  });
+  ta.addEventListener('focus', () => {
+    if (boxState?.closing) { clearTimeout(boxState.closing); boxState.closing = null; }
+  });
+}
+
+function onBoxInput() {
+  if (!boxState) return;
+  const s = boxState;
+  const next = s.ta.value;
+  editor.value = editor.value.slice(0, s.start) + next + editor.value.slice(s.start + s.len);
+  s.len = next.length;
+  scheduleSync();
+}
+
+function closeBox() {
+  if (!boxState) return;
+  const s = boxState;
+  boxState = null;
+  if (s.closing) clearTimeout(s.closing);
+  s.wrap.remove();
+}
+
+// After patches land, re-anchor the open box to the block's new position
+// (it may have reflowed or moved to another page); close it gracefully if
+// the block id no longer exists (e.g. the edit split the block in two).
+function repositionBox() {
+  if (!boxState) return;
+  const s = boxState;
+  const pageDiv = [...document.querySelectorAll('.page')].find((d) =>
+    d.querySelector(`[data-src="${s.src}"]`)
+  );
+  if (!pageDiv) { closeBox(); return; }
+  const rect = blockRect(pageDiv, s.src);
+  if (!rect) { closeBox(); return; }
+  if (s.wrap.parentElement !== pageDiv) pageDiv.appendChild(s.wrap);
+  s.wrap.style.left = rect.left + '%';
+  s.wrap.style.top = rect.top + '%';
+  s.pageDiv = pageDiv;
+}
 
 // Template picker: start a fresh document from templates/*.tex
 async function loadTemplateList() {
@@ -565,6 +727,7 @@ sse.onmessage = (ev) => {
           if (patch.type === 'replace-page') renderPage(patch.displayList, true);
           else if (patch.type === 'remove-pages') removePagesFrom(patch.from);
         }
+        repositionBox();
       }
       return;
     }

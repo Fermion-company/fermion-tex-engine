@@ -169,6 +169,10 @@ export class CheckpointEngine {
         labels: (b.galley?.labels ?? []).map((l) => l.k),
         refs: b.galley?.refs ?? [],
         pages: blockPages.get(b.id) ?? [],
+        // raw offsets into the main buffer for in-preview box editing;
+        // blocks expanded from \input files are not editable in-place
+        file: b.file ?? null,
+        span: b.file ? null : { start: b.start, end: b.end },
       })),
       labels: Object.fromEntries(this.labelTable),
     };
