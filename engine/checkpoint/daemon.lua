@@ -279,13 +279,13 @@ walk_h = function(head, parent, x0, dy0, out)
       end
       -- slots below 32 (legacy greek etc.) travel as PUA so JSON stays clean
       local c = n.char or 63
-      -- big cmex variants (large radicals, delimiters, operators) have no
-      -- browser-drawable unicode twin of the right size: route the block
-      -- through the exact-render tier (glyphs remain as instant preview)
-      if fi and fi.name and fi.name:find('^cmex') then
-        if (c >= 0x10 and c <= 0x4f) or (c >= 0x58 and c <= 0x77) then
-          blk_gfx = true
-        end
+      -- Legacy Computer Modern (Type1) glyphs — i.e. classic math setups —
+      -- cannot be reproduced exactly in the browser (no Type1 @font-face,
+      -- twins differ subtly). Route such blocks through the exact-render
+      -- tier: the instant glyph approximation shows while typing and the
+      -- print-identical SVG swaps in right after.
+      if fi and fi.name and fi.name:find('^cm%l*%d') then
+        blk_gfx = true
       end
       if c < 32 then c = 0xE000 + c end
       run.g[#run.g + 1] = { c, gx }

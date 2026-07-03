@@ -313,6 +313,7 @@ export class CheckpointEngine {
     this.counters = [...BASE_COUNTERS, ...scanCounterDefs(preamble)];
     writeFileSync(path.join(this.workDir, 'driver.tex'), this.#driverSource(preamble));
 
+    rmSync(path.join(this.workDir, 'driver.pdf'), { force: true });
     const ckptReady = this.#await('ckpt:0', BOOT_TIMEOUT);
     const geoReady = this.#await('geo', BOOT_TIMEOUT);
     this.root = spawn(
@@ -340,6 +341,11 @@ export class CheckpointEngine {
     await Promise.all([ckptReady, geoReady]).catch((err) => {
       throw new Error(`preamble build failed — ${texErrorFrom(rootLog) || err.message}`);
     });
+    // hyperref (and friends) write PDF objects during \begin{document},
+    // which opens the shared output file at the root — checkpoint children
+    // can then no longer ship their own tight pages. Fall back to isolated
+    // per-block compiles for the exact-render tier in that case.
+    this.pdfOpenedAtRoot = existsSync(path.join(this.workDir, 'driver.pdf'));
   }
 
   #driverSource(preamble) {
@@ -839,9 +845,18 @@ export class CheckpointEngine {
   async #renderBlock(block) {
     const idx = this.blocks.indexOf(block);
     if (idx < 0) return;
+    if (this.pdfOpenedAtRoot) return this.#renderIsolated(block, idx);
     const ck = this.checkpoints.get(idx);
     if (!ck) return;
-    const jobdir = path.join(this.workDir, 'render-' + block.id);
+    // one render per (block, content); stale results are discarded so a
+    // fast typist never sees an outdated exact image over live glyphs
+    const forGalley = block.galleyHash;
+    const inflightKey = block.id + ':' + forGalley;
+    this.rendering ??= new Set();
+    if (this.rendering.has(inflightKey)) return;
+    this.rendering.add(inflightKey);
+    try {
+    const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
     mkdirSync(jobdir, { recursive: true });
     rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
     const body = Buffer.from(block.text, 'utf8');
@@ -870,9 +885,92 @@ export class CheckpointEngine {
       );
       const svg = readFileSync(svgPath, 'utf8');
       const prev = this.chunks.get(tgt.key);
-      this.chunks.set(tgt.key, { svg, wBp: tgt.w, hBp: tgt.h, v: (prev?.v ?? 0) + 1 });
+      this.chunks.set(tgt.key, {
+        svg,
+        wBp: tgt.w,
+        hBp: tgt.h,
+        v: (prev?.v ?? 0) + 1,
+        forGalley,
+      });
     }
-    this.#asyncRepaginate();
+    if (block.galleyHash === forGalley) this.#asyncRepaginate();
+    } finally {
+      this.rendering.delete(inflightKey);
+    }
+  }
+
+  /**
+   * Exact render via a standalone lualatex run — used when the resident
+   * tree cannot ship pages (hyperref opened the PDF at boot). Slower
+   * (full preamble per render) but pixel-exact all the same.
+   */
+  async #renderIsolated(block, idx) {
+    if ((block.galley?.floats ?? []).length) {
+      this.diagnostics.push(
+        `render ${block.id}: float chunks unavailable under hyperref-style preambles (instant glyphs kept)`
+      );
+      return;
+    }
+    const forGalley = block.galleyHash;
+    const inflightKey = 'iso:' + block.id + ':' + forGalley;
+    this.rendering ??= new Set();
+    if (this.rendering.has(inflightKey)) return;
+    this.rendering.add(inflightKey);
+    try {
+      // entry counters = fold of state deltas over the preceding chain
+      const entry = Object.fromEntries(this.counters.map((c) => [c, 0]));
+      for (let j = 0; j < idx; j++) {
+        for (const [k, v] of Object.entries(this.blocks[j].stateDelta ?? {})) {
+          entry[k] = (entry[k] ?? 0) + v;
+        }
+      }
+      const text = this.store.get(this.file);
+      const bounds = documentBounds(text);
+      const L = [];
+      L.push(text.slice(bounds.preamble.start, bounds.preamble.end).trimEnd());
+      L.push('\\begin{document}');
+      L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
+      for (const [key, val] of this.labelTable) {
+        if (key.startsWith('cite:')) L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
+        else L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+      }
+      for (const [name, val] of Object.entries(entry)) {
+        L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
+      }
+      L.push('\\makeatother');
+      L.push('\\setbox0=\\vbox{\\hsize=\\textwidth');
+      if (this.#noindentFor(idx)) L.push('\\noindent');
+      L.push(block.text.trimEnd());
+      L.push('\\par}');
+      L.push('\\directlua{local b=tex.box[0] tex.pagewidth=math.max(b.width or 0,65536) tex.pageheight=math.max((b.height or 0)+(b.depth or 0),65536)}');
+      L.push('\\shipout\\box0');
+      L.push('\\end{document}');
+      const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
+      mkdirSync(jobdir, { recursive: true });
+      rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
+      writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
+      await execFileP('lualatex', ['-interaction=nonstopmode', 'iso.tex'], {
+        cwd: jobdir,
+        timeout: 90_000,
+      }).catch(() => {});
+      const pdf = path.join(jobdir, 'iso.pdf');
+      if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
+      const svgPath = path.join(jobdir, 'iso.svg');
+      await execFileP('pdftocairo', ['-svg', '-f', '1', '-l', '1', pdf, svgPath], { timeout: 30_000 });
+      const svg = readFileSync(svgPath, 'utf8');
+      const prev = this.chunks.get(block.id);
+      this.chunks.set(block.id, {
+        svg,
+        wBp: block.galley.w,
+        hBp: block.galley.h + block.galley.d,
+        v: (prev?.v ?? 0) + 1,
+        forGalley,
+      });
+      if (block.galleyHash === forGalley) this.#asyncRepaginate();
+      rmSync(jobdir, { recursive: true, force: true });
+    } finally {
+      this.rendering.delete(inflightKey);
+    }
   }
 
   #asyncRepaginate() {
@@ -911,12 +1009,16 @@ export class CheckpointEngine {
     const geo = this.geometry;
     let prevLastBox = null;
     for (const block of this.blocks) {
-      const hasChunk = this.chunks.has(block.id);
+      const bc = this.chunks.get(block.id);
+      const hasChunk = !!bc && bc.forGalley === block.galleyHash;
       const floatVs = (block.galley?.floats ?? [])
-        .map((f) => this.chunks.get(block.id + '#' + f.n)?.v ?? 0)
+        .map((f) => {
+          const fc = this.chunks.get(block.id + '#' + f.n);
+          return fc && fc.forGalley === block.galleyHash ? fc.v : 0;
+        })
         .join(',');
       const sig = `${block.galleyHash}|${prevLastBox ? prevLastBox.d : 'x'}|${
-        hasChunk ? this.chunks.get(block.id).v : 0
+        hasChunk ? bc.v : 0
       }|${floatVs}`;
       if (!block.units || block.unitsSig !== sig) {
         block.units = buildUnits(block, geo, prevLastBox, hasChunk, this.chunks);
@@ -1221,7 +1323,9 @@ function buildUnits(block, geo, prevLastBox, hasChunk, chunks) {
     const f = floats.find((x) => x.n === n);
     if (!f) return null;
     const chunkKey = block.id + '#' + f.n;
-    const chunkRef = f.gfx && chunks.has(chunkKey) ? { key: chunkKey, w: f.w } : null;
+    const fc = chunks.get(chunkKey);
+    const chunkRef =
+      f.gfx && fc && fc.forGalley === block.galleyHash ? { key: chunkKey, w: f.w } : null;
     return {
       id: chunkKey,
       placement: f.placement,

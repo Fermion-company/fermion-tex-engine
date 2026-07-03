@@ -1,0 +1,46 @@
+\documentclass[11pt,a4paper]{ltjsarticle}
+
+% パッケージの読み込み
+\usepackage{luatexja} % LuaLaTeXで日本語を扱うための基本パッケージ
+\usepackage{graphicx} % 画像挿入用
+\usepackage{amsmath,amssymb} % 数式用
+\usepackage{hyperref} % リンク・目次用
+% \usepackage{k}  % ← 入力途中だったため一時コメントアウト
+
+
+\title{LuaLaTeX テスト文書}
+\author{双子座のAI}
+\date{\today}
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\clearpage
+
+\section{はじめ}
+これLuaLaTeXでコンパイルするためのサンプルテキストです。
+LuaLaTeXは、従来のpdfLaTeXやpLaTeXに比べ、Unicodeの扱いが強力で、フォントの設定も柔軟に行えるという特徴があります。
+
+\section{文章のテスト}
+通常の日本語文章はもちろん、**太字**や*斜体（※日本語フォントによっては立体になる場合があります）*の表現も可能です。
+
+箇条書きの例：
+\begin{itemize}
+    \item 最初のアイテム
+    \item 2番目のアイテム
+    \item 3番目のアイテム
+\end{itemize}
+
+\section{数式のテスト}
+インライン数式は $E = mc^2$ のように記述します。
+独立した数式（ディスプレイスタイル）は以下のように綺麗にレンダリングされます。
+
+\begin{equation}
+    \int_{0}^{\infty} e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+\end{equation}
+
+\section{おわりに}
+このファイルが無事にPDFとして出力されれば、あなたの環境のLuaLaTeXは正常に動作しています！
+
+\end{document}
