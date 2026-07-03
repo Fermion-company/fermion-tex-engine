@@ -969,7 +969,7 @@ function blockTypeLabel(block, source = '') {
   if (parseMathLens(raw)) return '数式';
   if (parseSimpleTableLens(raw)) return '表';
   const list = parseListLens(raw);
-  if (list) return list.env === 'enumerate' ? '番号付きリスト' : '箇条書き';
+  if (list) return listEnvironmentLabel(list.env);
   const alignment = parseAlignmentLens(raw);
   if (alignment) return alignmentEnvironmentLabel(alignment.env);
   if (/\\begin\{figure\}/.test(raw)) return '図';
@@ -1166,10 +1166,10 @@ function wordModelFromSource(raw, block) {
     return {
       kind: 'list',
       env: list.env,
-      title: list.env === 'enumerate' ? '番号付きリスト' : '箇条書き',
+      title: listEnvironmentLabel(list.env),
       label: null,
-      body: listItemsToBody(list.items),
-      bodyLabel: '項目（1行1項目）',
+      body: listItemsToBody(list.items, list.env),
+      bodyLabel: list.env === 'description' ? '項目（項目名: 内容）' : '項目（1行1項目）',
       raw,
     };
   }
@@ -1215,7 +1215,7 @@ function normalizeCodeBlockBody(body) {
 }
 
 function parseListLens(raw) {
-  const match = raw.match(/^(\s*)\\begin\{(itemize|enumerate)\}\s*([\s\S]*?)\s*\\end\{\2\}\s*$/);
+  const match = raw.match(/^(\s*)\\begin\{(itemize|enumerate|description)\}\s*([\s\S]*?)\s*\\end\{\2\}\s*$/);
   if (!match) return null;
   const body = match[3].trim();
   const itemRe = /\\item(?:\[([^\]]*)\])?\s*([\s\S]*?)(?=\\item(?:\[[^\]]*\])?\s*|$)/g;
@@ -1233,11 +1233,24 @@ function parseListLens(raw) {
   };
 }
 
-function listItemsToBody(items) {
+function listItemsToBody(items, env = 'itemize') {
   return items
-    .map((item) => `${item.marker ? `[${item.marker}] ` : ''}${stripTexForDisplay(item.text) || item.text}`.trim())
+    .map((item) => {
+      const marker = stripTexForDisplay(item.marker) || item.marker;
+      const text = stripTexForDisplay(item.text) || item.text;
+      if (env === 'description') return `${marker ? `${marker}: ` : ''}${text}`.trim();
+      return `${marker ? `[${marker}] ` : ''}${text}`.trim();
+    })
     .filter(Boolean)
     .join('\n');
+}
+
+function listEnvironmentLabel(env) {
+  return {
+    itemize: '箇条書き',
+    enumerate: '番号付きリスト',
+    description: '説明リスト',
+  }[env] || env;
 }
 
 function parseAlignmentLens(raw) {
@@ -1498,6 +1511,7 @@ function wrapWordSelection(format) {
 }
 
 function formatDefaultText(format) {
+  if (format === 'description') return '項目1: 内容1\n項目2: 内容2';
   if (format === 'itemize' || format === 'enumerate') return '項目1\n項目2';
   if (format === 'quote') return '引用文';
   if (format === 'footnote') return '脚注の内容';
@@ -1525,10 +1539,10 @@ function wordFormatText(format, text) {
   if (format === 'center' || format === 'flushleft' || format === 'flushright') {
     return `\\begin{${format}}\n${text}\n\\end{${format}}`;
   }
-  if (format === 'itemize' || format === 'enumerate') {
-    const env = format === 'itemize' ? 'itemize' : 'enumerate';
+  if (format === 'itemize' || format === 'enumerate' || format === 'description') {
+    const env = format;
     const items = String(text).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    return `\\begin{${env}}\n${items.map((item) => `\\item ${item}`).join('\n')}\n\\end{${env}}`;
+    return buildListTex(env, items.join('\n')).trim();
   }
   return text;
 }
@@ -2013,6 +2027,7 @@ function selectedAiCommand(mode, prompt) {
   if (mode === 'page-style') return 'page-style';
   if (/```|function |const |class |import |def /i.test(prompt)) return 'code';
   if (/\|.*\||表|table/i.test(prompt)) return 'table';
+  if (/^\s*[^:：\n]+[:：]\s+.+$/m.test(prompt) || /説明リスト|description/i.test(prompt)) return 'description';
   if (/^[-*]\s+/m.test(prompt)) return 'itemize';
   if (/^\d+[.)]\s+/m.test(prompt)) return 'enumerate';
   if (/^>|\bquote\b|引用/.test(prompt)) return 'quote';
@@ -2214,13 +2229,16 @@ function buildAiDraft(mode, prompt, commandOverride = null) {
       packages: ['amsmath'],
     };
   }
-  if (command === 'itemize' || command === 'enumerate') {
+  if (command === 'itemize' || command === 'enumerate' || command === 'description') {
     const env = command;
-    const items = (listItems.length ? listItems : [text]).map((item) => `  \\item ${escapeLatexText(item)}`);
+    const items =
+      command === 'description'
+        ? buildListTex(env, (listItems.length ? listItems : lines.length ? lines : [text]).join('\n')).trim()
+        : `\\begin{${env}}\n${(listItems.length ? listItems : [text]).map((item) => `  \\item ${escapeLatexText(item)}`).join('\n')}\n\\end{${env}}`;
     return {
-      title: command === 'itemize' ? '箇条書き' : '番号付きリスト',
-      preview: `${env} 環境として追加します。\n${items.map((item) => item.replace('  \\item ', '- ')).join('\n')}`,
-      tex: `\n\\begin{${env}}\n${items.join('\n')}\n\\end{${env}}\n`,
+      title: listEnvironmentLabel(env),
+      preview: `${env} 環境として追加します。\n${items.replace(/^\\begin\{[^{}]+\}\n?|\n?\\end\{[^{}]+\}$/g, '').trim()}`,
+      tex: `\n${items}\n`,
       packages: [],
     };
   }
@@ -2435,7 +2453,7 @@ function buildRegionTex() {
   if (type === 'center' || type === 'flushleft' || type === 'flushright') {
     return '\n' + buildAlignmentTex(type, body);
   }
-  if (type === 'itemize' || type === 'enumerate') {
+  if (type === 'itemize' || type === 'enumerate' || type === 'description') {
     return '\n' + buildListTex(type, body);
   }
   if (['theorem', 'lemma', 'definition'].includes(type)) {
@@ -2455,9 +2473,14 @@ function buildListTex(env, body) {
     .map((line) => {
       const marker = line.match(/^\[([^\]]+)\]\s*(.*)$/);
       if (marker) return `  \\item[${escapeLatexText(marker[1].trim())}] ${escapeLatexText(marker[2].trim() || '項目')}`;
+      if (env === 'description') {
+        const pair = line.match(/^([^:：]+)[:：]\s*(.*)$/);
+        if (pair) return `  \\item[${escapeLatexText(pair[1].trim())}] ${escapeLatexText(pair[2].trim() || '内容')}`;
+        return `  \\item[${escapeLatexText(line)}] 内容`;
+      }
       return `  \\item ${escapeLatexText(line)}`;
     });
-  const safeItems = items.length ? items : ['  \\item 項目'];
+  const safeItems = items.length ? items : [env === 'description' ? '  \\item[項目] 内容' : '  \\item 項目'];
   return `\\begin{${env}}\n${safeItems.join('\n')}\n\\end{${env}}\n`;
 }
 
@@ -5022,6 +5045,8 @@ function openPreviewInsertPanel(targetSrc, pageDiv) {
         <option value="equation">数式</option>
         <option value="align">整列数式</option>
         <option value="itemize">箇条書き</option>
+        <option value="enumerate">番号付きリスト</option>
+        <option value="description">説明リスト</option>
         <option value="quote">引用</option>
       </select>
     </label>
@@ -5080,7 +5105,7 @@ function buildPreviewInsertTex(type, title, body) {
     const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line, index, arr) => `  ${escapeLatexMath(line)}${index < arr.length - 1 ? ' \\\\' : ''}`);
     return `\n\\begin{align}\n  \\label{eq:${slugifyLabel(heading || text.slice(0, 32))}}\n${lines.join('\n')}\n\\end{align}\n`;
   }
-  if (type === 'itemize') return '\n' + buildListTex('itemize', text);
+  if (type === 'itemize' || type === 'enumerate' || type === 'description') return '\n' + buildListTex(type, text);
   if (type === 'quote') return `\n\\begin{quote}\n${escapeLatexText(text)}\n\\end{quote}\n`;
   return `\n${escapeLatexText(text)}\n`;
 }
