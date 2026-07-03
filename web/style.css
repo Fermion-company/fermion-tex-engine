@@ -37,9 +37,9 @@ body {
 #topbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  height: 52px;
-  padding: 0 14px;
+  gap: 8px;
+  height: 42px;
+  padding: 0 10px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
@@ -47,34 +47,30 @@ body {
 .brand {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  max-width: clamp(190px, 32vw, 430px);
+  max-width: clamp(160px, 25vw, 260px);
   white-space: nowrap;
 }
 .brand .logo {
   color: var(--accent);
-  font-size: 20px;
+  font-size: 17px;
   font-weight: 700;
 }
-.brand .name { font-weight: 700; font-size: 15px; }
-.brand .sub {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--dim);
-  font-size: 11px;
-  text-overflow: ellipsis;
-}
+.brand .name { font-weight: 700; font-size: 13px; }
 
 .status {
-  flex: 1 1 160px;
-  min-width: 88px;
+  flex: 1 1 96px;
+  min-width: 0;
   font-variant-numeric: tabular-nums;
   color: var(--accent);
-  font-size: 12px;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.status:empty {
+  display: none;
 }
 
 .actions {
@@ -82,12 +78,11 @@ body {
   flex: 0 1 auto;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
-  max-width: min(640px, 55vw);
+  max-width: min(560px, 58vw);
   overflow-x: auto;
   overflow-y: hidden;
-  padding-bottom: 2px;
   scrollbar-width: thin;
 }
 .actions > * {
@@ -99,19 +94,21 @@ body {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  min-height: 30px;
-  padding: 6px 9px;
-  font-size: 12px;
+  border-radius: 5px;
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 11px;
 }
 .topbar-menu-toggle {
   flex: 0 0 auto;
+  width: 26px;
+  padding-inline: 0;
   cursor: pointer;
   white-space: nowrap;
 }
 .actions select {
   cursor: pointer;
-  max-width: 180px;
+  max-width: 136px;
 }
 .actions select:hover { border-color: var(--accent); }
 .actions button {
@@ -183,17 +180,16 @@ body.is-resizing-layout {
 }
 
 @media (max-width: 1050px) {
-  .brand .sub { display: none; }
-  .actions { max-width: min(560px, 58vw); }
-  .actions select { max-width: 142px; }
+  .actions { max-width: min(500px, 58vw); }
+  .actions select { max-width: 122px; }
 }
 
 @media (max-width: 760px) {
   #topbar {
     flex-wrap: wrap;
     height: auto;
-    min-height: 52px;
-    padding: 8px 10px;
+    min-height: 42px;
+    padding: 6px 8px;
   }
   .brand {
     flex: 1 1 180px;

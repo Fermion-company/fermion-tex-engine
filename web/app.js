@@ -189,8 +189,10 @@ function splitColumnWidths(workspaceRatio) {
 function setMenuCollapsed(collapsed) {
   document.body.classList.toggle('menu-collapsed', collapsed);
   if (menuToggleButton) {
-    menuToggleButton.textContent = collapsed ? 'Menu +' : 'Menu';
+    menuToggleButton.textContent = '☰';
     menuToggleButton.title = collapsed ? 'メニューバーを開く' : 'メニューバーを閉じる';
+    menuToggleButton.setAttribute('aria-label', menuToggleButton.title);
+    menuToggleButton.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   }
   applySplitRatio();
 }
@@ -311,10 +313,7 @@ async function boot() {
   const doc = await fetch('/doc').then((r) => r.json());
   adoptDoc(doc);
   loadUploadedTexFiles();
-  const ms = (doc.report.stats.totalUs / 1000).toFixed(0);
-  statusEl.textContent =
-    `常駐開始 [${backend}] — 初回フルビルド ${ms} ms / ${doc.report.stats.pageCount} pages / ` +
-    `${doc.report.stats.blocksTotal} blocks（以後は差分のみ）`;
+  statusEl.textContent = '';
   renderInspector(doc.report, null);
 }
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fermion TeX Engine — TeX DOM Runtime</title>
+<title>Fermion TeX Engine</title>
 <link rel="stylesheet" href="/mathlive/mathlive-static.css">
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -12,10 +12,9 @@
   <div class="brand">
     <span class="logo">Ψ</span>
     <span class="name">Fermion TeX Engine</span>
-    <span class="sub">TeX DOM Runtime — resident incremental typesetting</span>
   </div>
-  <button id="menu-toggle" class="topbar-menu-toggle" title="メニューバーを閉じる">Menu</button>
-  <div class="status" id="status">起動中…</div>
+  <button id="menu-toggle" class="topbar-menu-toggle" title="メニューバーを閉じる" aria-label="メニューバーを閉じる">☰</button>
+  <div class="status" id="status"></div>
   <div class="actions">
     <select id="layout-view" title="表示するペイン">
       <option value="both" selected>両方表示</option>
@@ -25,7 +24,7 @@
     <select id="tpl-select" title="テンプレートから新規作成">
       <option value="">テンプレート…</option>
     </select>
-    <button id="btn-pdf" title="Display List から PDF を生成">PDF 書き出し</button>
+    <button id="btn-pdf" title="Display List から PDF を生成">PDF</button>
     <button id="btn-reset" title="サンプル文書に戻す">リセット</button>
   </div>
 </header>
