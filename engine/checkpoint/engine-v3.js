@@ -40,7 +40,7 @@ const BASE_COUNTERS = [
 ];
 const HEADING_RE = /^\s*\\(section|subsection|subsubsection|paragraph)\b/;
 const JOB_TIMEOUT = 30_000;
-const BOOT_TIMEOUT = 120_000;
+const BOOT_TIMEOUT = 60_000;
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
@@ -218,6 +218,15 @@ export class CheckpointEngine {
       for (const [idx, p] of this.checkpoints) {
         if (p === peer) this.checkpoints.delete(idx);
       }
+      // fail fast: if the process carrying the in-flight job dies (TeX
+      // emergency stop on a broken block, missing file, ...), reject its
+      // waiters immediately instead of running out the 30s timeout
+      const job = this.currentJob;
+      if (job && (peer === job.parent || (job.pid && peer.pid === job.pid))) {
+        const err = new Error('typesetting process died (TeX error in this block?)');
+        this._reject(job.galleyKey, err);
+        this._reject(job.ckptKey, err);
+      }
     });
   }
 
@@ -240,12 +249,22 @@ export class CheckpointEngine {
     }
   }
 
+  _reject(key, err) {
+    const w = this.waiters.get(key);
+    if (w) {
+      clearTimeout(w.timer);
+      this.waiters.delete(key);
+      w.reject(err);
+    }
+  }
+
   // message dispatch from Peer
   _onMessage(peer, msg) {
     switch (msg.kind) {
       case 'HELLO':
         peer.role = msg.role;
         peer.pid = msg.pid;
+        peer.idxAnnounced = msg.idx;
         if (msg.role === 'ckpt' && msg.idx === 0) {
           this.checkpoints.set(0, peer);
           this._fulfill('ckpt:0', peer);
@@ -267,6 +286,11 @@ export class CheckpointEngine {
         break;
       case 'DONE':
         this._fulfill('render:' + msg.id, true);
+        break;
+      case 'FORKED':
+        if (this.currentJob && this.currentJob.galleyKey === 'galley:' + msg.id) {
+          this.currentJob.pid = msg.pid;
+        }
         break;
     }
   }
@@ -299,15 +323,22 @@ export class CheckpointEngine {
     let rootLog = '';
     this.root.stdout.on('data', (d) => { rootLog += d; if (rootLog.length > 65536) rootLog = rootLog.slice(-32768); });
     this.root.stderr.on('data', (d) => { rootLog += d; });
-    this.root.on('exit', (code) => {
+    const rootRef = this.root;
+    this.root.on('exit', () => {
+      if (this.root !== rootRef) return; // a superseded root dying is expected
       this.rootLog = rootLog;
+      // a dead root can never announce ckpt:0 — fail the boot immediately
+      // (a broken preamble in nonstopmode still prompts on missing files
+      // and emergency-stops on EOF)
+      const err = new Error('lualatex exited during preamble: ' + texErrorFrom(rootLog));
+      this._reject('ckpt:0', err);
+      this._reject('geo', err);
+      this.checkpoints.clear();
     });
     this.rootLogRef = () => rootLog;
 
     await Promise.all([ckptReady, geoReady]).catch((err) => {
-      throw new Error(
-        `daemon boot failed: ${err.message}\n--- lualatex output tail ---\n${rootLog.slice(-2000)}`
-      );
+      throw new Error(`preamble build failed — ${texErrorFrom(rootLog) || err.message}`);
     });
   }
 
@@ -424,13 +455,20 @@ export class CheckpointEngine {
       ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
       : '';
     const body = Buffer.from(prelude + block.text, 'utf8');
-    const galleyP = this.#await('galley:' + block.id);
-    const ckptP = this.#await('ckpt:' + (idx + 1));
-    ck.send(`JOB ${block.id} ${idx + 1} ${noindent ? 1 : 0}:${body.length}\n`);
-    ck.sendRaw(body);
-    const [galley] = await Promise.all([galleyP, ckptP]);
-    this.#retireOffGrid(idx);
-    return galley;
+    const galleyKey = 'galley:' + block.id;
+    const ckptKey = 'ckpt:' + (idx + 1);
+    const galleyP = this.#await(galleyKey);
+    const ckptP = this.#await(ckptKey);
+    this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
+    try {
+      ck.send(`JOB ${block.id} ${idx + 1} ${noindent ? 1 : 0}:${body.length}\n`);
+      ck.sendRaw(body);
+      const [galley] = await Promise.all([galleyP, ckptP]);
+      this.#retireOffGrid(idx);
+      return galley;
+    } finally {
+      this.currentJob = null;
+    }
   }
 
   // Sparse checkpoints: for large documents only every grid-th boundary
@@ -508,7 +546,7 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- update
 
-  async #update({ editLabel }) {
+  async #update({ editLabel, retry = false }) {
     const t = new Timer();
     const text = this.store.get(this.file);
     const diagnostics = [];
@@ -573,6 +611,11 @@ export class CheckpointEngine {
     }
 
     // ---- foreground typeset: resume from the nearest kept snapshot -----
+    // Any failure in the typeset phase (dead checkpoint, TeX emergency
+    // stop, protocol timeout) triggers ONE full rebuild retry; if that
+    // also fails the error surfaces to the client while the last good
+    // pages keep being served.
+    try {
     const dirtyBlocks = [];
     const depDirty = [];
     const changedLabels = new Set();
@@ -693,6 +736,18 @@ export class CheckpointEngine {
       if (!anyConsumer) break;
     }
     t.lap('toc');
+    this._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop };
+    } catch (err) {
+      if (!retry) {
+        this.diagnostics.push('typeset phase failed (' + err.message + ') — full rebuild');
+        this.preHash = null; // force a root reboot on the retry pass
+        for (const peer of this.peers) peer.send('DIE\n');
+        this.checkpoints.clear();
+        return this.#update({ editLabel, retry: true });
+      }
+      throw err;
+    }
+    const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop } = this._typesetResult;
 
     // ---- pages, display lists, patches ---------------------------------
     const pagesRaw = this.#paginateNow();
@@ -1134,6 +1189,8 @@ class Peer {
           this.engine._onMessage(this, { kind: 'DONE', id: parts[1] });
           break;
         case 'FORKED':
+          this.engine._onMessage(this, { kind: 'FORKED', id: parts[1], pid: Number(parts[2]) });
+          break;
         case 'PONG':
           break;
         default:
@@ -1320,6 +1377,14 @@ function resolvedInGalley(block, key, labelTable) {
   }
   if (block.__galleyText.includes('??') || block.__galleyText.includes('[?]')) return false;
   return block.__galleyText.includes(String(val));
+}
+
+/** Pull the first TeX error lines out of a lualatex log/stdout capture. */
+function texErrorFrom(log) {
+  const lines = String(log || '').split('\n');
+  const idx = lines.findIndex((l) => l.startsWith('! '));
+  if (idx < 0) return '';
+  return lines.slice(idx, idx + 2).join(' ').trim();
 }
 
 function scanCounterDefs(preamble) {
