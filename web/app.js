@@ -141,6 +141,7 @@ let aiDraft = null;
 let aiLastPrompt = '';
 let uploadedTexFiles = [];
 let selectedCodeFile = null;
+let pendingCodeFile = null;
 let tableData = [
   ['項目', '値', '備考'],
   ['Alpha', '1.0', ''],
@@ -2686,6 +2687,10 @@ function texFileKind(name, selected = 'auto') {
   return 'tex';
 }
 
+function isSupportedTexFile(file) {
+  return ['sty', 'tex', 'bib', 'cls'].includes(String(file?.name || '').split('.').pop()?.toLowerCase());
+}
+
 function readTextFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -2739,7 +2744,21 @@ function uploadedTexFileByPath(texPath) {
 function setSelectedCodeFile(selection) {
   selectedCodeFile = selection;
   if (codePickedFileEl) {
-    codePickedFileEl.textContent = selection?.path || codeFileInputEl?.files?.[0]?.name || '未選択';
+    codePickedFileEl.textContent = selection?.path || pendingCodeFile?.name || codeFileInputEl?.files?.[0]?.name || '未選択';
+  }
+  renderCodeFileList(editor.value);
+}
+
+function pickLocalCodeFile(file) {
+  pendingCodeFile = file || null;
+  selectedCodeFile = null;
+  if (codePickedFileEl) codePickedFileEl.textContent = file ? file.name : '未選択';
+  if (file) {
+    readTextFile(file)
+      .then((text) => renderCodeFilePreview(`${file.name} / ${file.size} bytes`, text))
+      .catch((err) => renderCodeFilePreview(file.name, '', `ファイルを読み込めませんでした: ${err.message}`));
+  } else {
+    renderCodeFilePreview('', '');
   }
   renderCodeFileList(editor.value);
 }
@@ -2761,7 +2780,7 @@ async function previewUploadedCodeFile(selection) {
 }
 
 async function integrateSelectedCodeFile() {
-  const file = codeFileInputEl?.files?.[0];
+  const file = pendingCodeFile || codeFileInputEl?.files?.[0];
   const selectedUploaded = selectedCodeFile?.uploaded ? uploadedTexFileByPath(selectedCodeFile.path) : null;
   if (!file) {
     if (!selectedUploaded) {
@@ -2780,6 +2799,7 @@ async function integrateSelectedCodeFile() {
         ? `${saved.texPath} を保存しました。文書クラスの切り替えはカスタマイズで行います`
         : `${saved.texPath} を文書に組み込みました`;
     selectedCodeFile = null;
+    pendingCodeFile = null;
     if (codeFileInputEl) codeFileInputEl.value = '';
     if (codePickedFileEl) codePickedFileEl.textContent = '未選択';
     renderCodeFileList(editor.value);
@@ -2818,26 +2838,39 @@ codeFileIntegrateButton?.addEventListener('click', integrateSelectedCodeFile);
 codeSplitCreateButton?.addEventListener('click', createSplitTexFile);
 codeFilePickButton?.addEventListener('click', () => codeFileInputEl?.click());
 codeFileInputEl?.addEventListener('change', () => {
-  const file = codeFileInputEl.files?.[0];
-  selectedCodeFile = null;
-  if (codePickedFileEl) codePickedFileEl.textContent = file ? file.name : '未選択';
-  if (file) {
-    readTextFile(file)
-      .then((text) => renderCodeFilePreview(`${file.name} / ${file.size} bytes`, text))
-      .catch((err) => renderCodeFilePreview(file.name, '', `ファイルを読み込めませんでした: ${err.message}`));
-  } else {
-    renderCodeFilePreview('', '');
-  }
-  renderCodeFileList(editor.value);
+  pickLocalCodeFile(codeFileInputEl.files?.[0] || null);
 });
 codeFileListEl?.addEventListener('click', (ev) => {
   const item = ev.target.closest?.('[data-code-file-path]');
   if (!item || !codePickedFileEl) return;
   const path = item.dataset.codeFilePath || '';
   const uploaded = item.dataset.codeFileUploaded === 'true';
+  pendingCodeFile = null;
   setSelectedCodeFile({ path, uploaded, kind: item.dataset.codeFileKind || 'auto' });
   if (uploaded && codeFileInputEl) codeFileInputEl.value = '';
   previewUploadedCodeFile(selectedCodeFile);
+});
+
+document.querySelector('.code-sidebar')?.addEventListener('dragover', (ev) => {
+  if (![...ev.dataTransfer?.items || []].some((item) => item.kind === 'file')) return;
+  ev.preventDefault();
+  ev.currentTarget.classList.add('is-dropping');
+});
+document.querySelector('.code-sidebar')?.addEventListener('dragleave', (ev) => {
+  if (ev.relatedTarget && ev.currentTarget.contains(ev.relatedTarget)) return;
+  ev.currentTarget.classList.remove('is-dropping');
+});
+document.querySelector('.code-sidebar')?.addEventListener('drop', (ev) => {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('is-dropping');
+  const file = [...ev.dataTransfer?.files || []].find(isSupportedTexFile);
+  if (!file) {
+    statusEl.textContent = '.tex/.sty/.cls/.bib ファイルをドロップしてください';
+    return;
+  }
+  if (codeFileInputEl) codeFileInputEl.value = '';
+  pickLocalCodeFile(file);
+  statusEl.textContent = `${file.name} を選択しました`;
 });
 
 async function insertImageFigure() {
