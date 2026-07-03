@@ -16,7 +16,12 @@ const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const menuToggleButton = document.getElementById('menu-toggle');
 const layoutViewEl = document.getElementById('layout-view');
-const splitRangeEl = document.getElementById('split-range');
+const splitReadoutEl = document.getElementById('split-readout');
+const layoutSplitterEl = document.getElementById('workspace-preview-splitter');
+const layoutEl = document.getElementById('layout');
+const editorPaneEl = document.getElementById('editor-pane');
+const workspacePaneEl = document.getElementById('workspace-pane');
+const previewPaneEl = document.getElementById('preview-pane');
 const outlineEl = document.getElementById('doc-outline');
 const visualEditorEl = document.getElementById('visual-editor');
 const wordEditorEl = document.getElementById('word-editor');
@@ -153,15 +158,34 @@ let tableData = [
   ['Gamma', '3.0', ''],
 ];
 const tableMerges = new Map();
+let splitRatio = 48;
 
 function applyLayoutView(value = layoutViewEl?.value || 'both') {
   document.body.dataset.layoutView = value;
 }
 
-function applySplitRatio(value = splitRangeEl?.value || 48) {
-  const workspace = Math.max(35, Math.min(70, Number(value) || 48));
-  document.documentElement.style.setProperty('--workspace-fr', `${workspace}fr`);
-  document.documentElement.style.setProperty('--preview-fr', `${100 - workspace}fr`);
+function applySplitRatio(value = splitRatio) {
+  const workspace = Math.max(35, Math.min(70, Number(value) || splitRatio || 48));
+  splitRatio = workspace;
+  const { workspacePx, previewPx } = splitColumnWidths(workspace);
+  document.documentElement.style.setProperty('--workspace-width', `${workspacePx}px`);
+  document.documentElement.style.setProperty('--preview-width', `${previewPx}px`);
+  if (splitReadoutEl) splitReadoutEl.textContent = `${Math.round(workspace)} / ${Math.round(100 - workspace)}`;
+  layoutSplitterEl?.setAttribute('aria-valuenow', String(Math.round(workspace)));
+}
+
+function splitColumnWidths(workspaceRatio) {
+  const layoutWidth = layoutEl?.getBoundingClientRect().width || window.innerWidth || 1;
+  const menuVisible = editorPaneEl && getComputedStyle(editorPaneEl).display !== 'none';
+  const menuWidth = menuVisible ? editorPaneEl.getBoundingClientRect().width : 0;
+  const splitterVisible = layoutSplitterEl && getComputedStyle(layoutSplitterEl).display !== 'none';
+  const splitterWidth = splitterVisible ? layoutSplitterEl.getBoundingClientRect().width || 8 : 0;
+  const available = Math.max(1, layoutWidth - menuWidth - splitterWidth);
+  const workspacePx = Math.round((available * workspaceRatio) / 100);
+  return {
+    workspacePx,
+    previewPx: Math.max(1, Math.round(available - workspacePx)),
+  };
 }
 
 function setMenuCollapsed(collapsed) {
@@ -170,6 +194,45 @@ function setMenuCollapsed(collapsed) {
     menuToggleButton.textContent = collapsed ? 'Menu +' : 'Menu';
     menuToggleButton.title = collapsed ? 'メニューバーを開く' : 'メニューバーを閉じる';
   }
+  applySplitRatio();
+}
+
+function splitRatioFromPointer(clientX) {
+  if (!workspacePaneEl || !previewPaneEl) return splitRatio;
+  const workspaceRect = workspacePaneEl.getBoundingClientRect();
+  const previewRect = previewPaneEl.getBoundingClientRect();
+  const left = workspaceRect.left;
+  const right = previewRect.right;
+  const total = right - left;
+  if (total <= 0) return splitRatio;
+  return ((clientX - left) / total) * 100;
+}
+
+function beginLayoutResize(ev) {
+  if (document.body.dataset.layoutView !== 'both') return;
+  ev.preventDefault();
+  layoutSplitterEl?.setPointerCapture?.(ev.pointerId);
+  document.body.classList.add('is-resizing-layout');
+  applySplitRatio(splitRatioFromPointer(ev.clientX));
+
+  function onPointerMove(moveEv) {
+    applySplitRatio(splitRatioFromPointer(moveEv.clientX));
+  }
+
+  function finish() {
+    document.body.classList.remove('is-resizing-layout');
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', finish);
+    window.removeEventListener('pointercancel', finish);
+  }
+
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', finish);
+  window.addEventListener('pointercancel', finish);
+}
+
+function nudgeLayoutSplit(delta) {
+  applySplitRatio(splitRatio + delta);
 }
 
 function highlightTexSource(source) {
@@ -1416,7 +1479,7 @@ function focusPreviewBlock(src) {
 function canOpenLensFromWorkspace(source) {
   if (!source.trim()) return false;
   if (/\\tableofcontents\b/.test(source)) return false;
-  return !!(parseMathLens(source) || parseCommandLens(source) || previewWordModelFromSource(source));
+  return !!(parseMathLens(source) || parseInlineMathLenses(source).length || parseCommandLens(source) || previewWordModelFromSource(source));
 }
 
 // ---------------------------------------------------------------- pages
@@ -1720,8 +1783,27 @@ document.getElementById('mode-nav')?.addEventListener('click', (ev) => {
   setWorkspaceMode(button.dataset.workspace);
 });
 
-layoutViewEl?.addEventListener('change', () => applyLayoutView(layoutViewEl.value));
-splitRangeEl?.addEventListener('input', () => applySplitRatio(splitRangeEl.value));
+layoutViewEl?.addEventListener('change', () => {
+  applyLayoutView(layoutViewEl.value);
+  applySplitRatio();
+});
+layoutSplitterEl?.addEventListener('pointerdown', beginLayoutResize);
+layoutSplitterEl?.addEventListener('keydown', (ev) => {
+  if (ev.key === 'ArrowLeft') {
+    ev.preventDefault();
+    nudgeLayoutSplit(-2);
+  } else if (ev.key === 'ArrowRight') {
+    ev.preventDefault();
+    nudgeLayoutSplit(2);
+  } else if (ev.key === 'Home') {
+    ev.preventDefault();
+    applySplitRatio(35);
+  } else if (ev.key === 'End') {
+    ev.preventDefault();
+    applySplitRatio(70);
+  }
+});
+window.addEventListener('resize', () => applySplitRatio());
 menuToggleButton?.addEventListener('click', () => setMenuCollapsed(!document.body.classList.contains('menu-collapsed')));
 applyLayoutView();
 applySplitRatio();
@@ -5018,6 +5100,8 @@ function createBlockEditor(source) {
   if (commandLens) return createCommandLensEditor(source, commandLens);
   const wordModel = previewWordModelFromSource(source);
   if (wordModel) return createPreviewWordModelEditor(wordModel);
+  const inlineMathEditor = createInlineMathBlockEditor(source);
+  if (inlineMathEditor) return inlineMathEditor;
   return createSourceTextareaEditor(source);
 }
 
@@ -5243,6 +5327,64 @@ function createMathLensEditor(source, lens) {
       activeMathfield = mathfield;
       mathfield.focus();
       if (typeof mathfield.executeCommand === 'function') {
+        mathfield.executeCommand('moveToMathfieldEnd');
+      }
+    },
+    grow: () => {},
+    destroy: () => keyboard.destroy(),
+  };
+}
+
+function createInlineMathBlockEditor(source) {
+  const lenses = parseInlineMathLenses(source);
+  if (!lenses.length || !ensureMathLiveElement()) return null;
+  const root = document.createElement('div');
+  root.className = 'boxmath boxmath-inline';
+
+  const mathLabel = document.createElement('div');
+  mathLabel.className = 'boxmath-label';
+  mathLabel.textContent = lenses.length === 1 ? 'インライン数式' : `インライン数式 ${lenses.length}件`;
+  root.appendChild(mathLabel);
+
+  const mathfields = [];
+  let activeMathfield = null;
+  lenses.forEach((lens, index) => {
+    const row = document.createElement('div');
+    row.className = 'boxmath-inline-row';
+    if (lenses.length > 1) {
+      const rowLabel = document.createElement('div');
+      rowLabel.className = 'boxmath-label';
+      rowLabel.textContent = `式 ${index + 1}`;
+      row.appendChild(rowLabel);
+    }
+    const mathfield = document.createElement('math-field');
+    mathfield.className = 'boxmath-field';
+    mathfield.setAttribute('virtual-keyboard-mode', 'manual');
+    mathfield.setAttribute('math-virtual-keyboard-policy', 'manual');
+    mathfield.setAttribute('placeholder', 'Enter formula');
+    row.appendChild(mathfield);
+    root.appendChild(row);
+    mathfields.push(mathfield);
+    mathfield.addEventListener('focusin', () => {
+      activeMathfield = mathfield;
+    });
+    configureMathField(mathfield);
+    writeMathFieldValue(mathfield, lens.math.trim());
+  });
+
+  activeMathfield = mathfields[0] ?? null;
+  const keyboard = createMathKeyboardPanel(() => activeMathfield ?? mathfields[0] ?? null);
+  root.appendChild(keyboard.el);
+
+  return {
+    kind: 'math',
+    el: root,
+    value: () => rebuildInlineMathBlock(source, lenses, mathfields.map((mathfield) => readMathFieldValue(mathfield).trim())),
+    focus: () => {
+      const mathfield = mathfields[0];
+      activeMathfield = mathfield;
+      mathfield?.focus();
+      if (typeof mathfield?.executeCommand === 'function') {
         mathfield.executeCommand('moveToMathfieldEnd');
       }
     },
@@ -5775,6 +5917,89 @@ function dispatchMathFieldInput(mathfield) {
   mathfield.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+function parseInlineMathLenses(source) {
+  const lenses = [];
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === '\\') {
+      if (source[i + 1] === '(') {
+        const end = findInlineParenMathEnd(source, i + 2);
+        if (end >= 0) {
+          const contentStart = i + 2;
+          lenses.push({
+            kind: 'inline',
+            begin: '\\(',
+            end: '\\)',
+            contentStart,
+            contentEnd: end,
+            math: source.slice(contentStart, end),
+          });
+          i = end + 1;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+    if (source[i] === '$' && source[i + 1] !== '$' && source[i - 1] !== '$' && !isEscapedTexChar(source, i)) {
+      const end = findInlineDollarMathEnd(source, i + 1);
+      if (end >= 0) {
+        const contentStart = i + 1;
+        lenses.push({
+          kind: 'inline',
+          begin: '$',
+          end: '$',
+          contentStart,
+          contentEnd: end,
+          math: source.slice(contentStart, end),
+        });
+        i = end;
+      }
+    }
+  }
+  return lenses;
+}
+
+function findInlineParenMathEnd(source, start) {
+  for (let i = start; i < source.length - 1; i++) {
+    if (source[i] === '\\') {
+      if (source[i + 1] === ')') return i;
+      i++;
+    }
+  }
+  return -1;
+}
+
+function findInlineDollarMathEnd(source, start) {
+  for (let i = start; i < source.length; i++) {
+    if (source[i] === '\n') return -1;
+    if (source[i] === '\\') {
+      i++;
+      continue;
+    }
+    if (source[i] === '$' && source[i + 1] !== '$' && source[i - 1] !== '$' && !isEscapedTexChar(source, i)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function isEscapedTexChar(source, index) {
+  let slashes = 0;
+  for (let i = index - 1; i >= 0 && source[i] === '\\'; i--) slashes++;
+  return slashes % 2 === 1;
+}
+
+function rebuildInlineMathBlock(source, lenses, values) {
+  let out = '';
+  let cursor = 0;
+  lenses.forEach((lens, index) => {
+    out += source.slice(cursor, lens.contentStart);
+    out += normalizeMathRowValue(values[index] ?? lens.math, lens).trim();
+    cursor = lens.contentEnd;
+  });
+  return out + source.slice(cursor);
+}
+
 function parseMathLens(source) {
   const envMatch = source.match(/^(\s*\\begin\{(equation\*?|align\*?|gather\*?|multline\*?)\}\s*)([\s\S]*?)(\s*\\end\{\2\}\s*)$/);
   if (envMatch) {
@@ -5946,9 +6171,9 @@ function repositionBox() {
 }
 
 function placeBoxEdit(wrap, rect) {
-  const isMath = wrap.dataset.editorKind === 'math';
-  const minWidth = isMath ? 64 : 42;
-  const maxWidth = isMath ? 94 : 88;
+  const isMath = wrap.dataset.editorKind === 'math' || wrap.dataset.editorKind === 'word-math';
+  const minWidth = isMath ? 80 : 42;
+  const maxWidth = isMath ? 98 : 88;
   const width = Math.min(Math.max(rect.width, minWidth), maxWidth);
   const left = Math.max(1, Math.min(rect.left, 99 - width));
   Object.assign(wrap.style, {

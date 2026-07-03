@@ -22,10 +22,7 @@
       <option value="workspace">ワークスペースのみ</option>
       <option value="preview">プレビューのみ</option>
     </select>
-    <label class="split-control" title="ワークスペースとプレビューの比率">
-      <span>Split</span>
-      <input id="split-range" type="range" min="35" max="70" value="48">
-    </label>
+    <span id="split-readout" class="split-readout" title="ワークスペースとプレビューの境界をドラッグして比率を変更">48 / 52</span>
     <select id="tpl-select" title="テンプレートから新規作成">
       <option value="">テンプレート…</option>
     </select>
@@ -579,6 +576,8 @@
       </div>
     </div>
   </section>
+
+  <div id="workspace-preview-splitter" role="separator" aria-orientation="vertical" aria-valuemin="35" aria-valuemax="70" aria-valuenow="48" tabindex="0" title="ドラッグしてワークスペースとプレビューの比率を変更"></div>
 
   <section id="preview-pane">
     <div class="pane-title">Preview <span class="hint">パッチされたページだけが光ります</span>
