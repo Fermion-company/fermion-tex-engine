@@ -750,5 +750,14 @@ sse.onmessage = (ev) => {
   }
 };
 
+// collapsible inspector (preference persists)
+function setInspector(hidden) {
+  document.body.classList.toggle('no-inspector', hidden);
+  localStorage.setItem('tdom-inspector', hidden ? 'hidden' : 'shown');
+}
+document.getElementById('insp-toggle').addEventListener('click', () => setInspector(true));
+document.getElementById('insp-reopen').addEventListener('click', () => setInspector(false));
+setInspector(localStorage.getItem('tdom-inspector') === 'hidden');
+
 boot();
 loadTemplateList();

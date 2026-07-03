@@ -284,3 +284,39 @@ section, aside { min-width: 0; display: flex; flex-direction: column; }
 .hist div { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; color: var(--dim); }
 .hist div b { color: var(--text); font-weight: 500; }
 .hist .t { color: var(--ok); }
+
+
+/* collapsible inspector: hide the panel, let the preview take the space */
+#insp-toggle {
+  float: right;
+  background: var(--panel-2);
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+}
+#insp-toggle:hover { color: var(--accent); border-color: var(--accent); }
+#insp-reopen {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  cursor: pointer;
+  color: var(--dim);
+  font-size: 14px;
+  user-select: none;
+}
+#insp-reopen:hover { color: var(--accent); background: var(--panel-2); }
+body.no-inspector #layout {
+  grid-template-columns: minmax(320px, 0.85fr) 1fr 26px;
+}
+body.no-inspector #inspector,
+body.no-inspector #inspector-pane .pane-title { display: none; }
+body.no-inspector #insp-reopen { display: flex; }
+body.no-inspector .page {
+  width: min(calc(96% * var(--zoom)), calc(940px * var(--zoom)));
+}
