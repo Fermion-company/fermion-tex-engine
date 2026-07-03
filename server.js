@@ -214,6 +214,21 @@ function listUploadedTexFiles() {
   return out;
 }
 
+function readUploadedTexFile(texPath) {
+  const raw = String(texPath || '').replace(/^uploads\//, '');
+  const rel = cleanTexPath(raw);
+  const file = path.resolve(UPLOADS_DIR, rel);
+  if (!file.startsWith(UPLOADS_DIR + path.sep)) throw new Error('bad tex file path');
+  const text = readFileSync(file, 'utf8');
+  return {
+    filename: rel,
+    texPath: `uploads/${rel}`,
+    packageName: packageNameForTexPath(`uploads/${rel}`),
+    text,
+    size: Buffer.byteLength(text, 'utf8'),
+  };
+}
+
 function previewId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -436,6 +451,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, saved, 201);
     }
     if (req.method === 'GET' && url.pathname === '/texfiles') return json(res, listUploadedTexFiles());
+    if (req.method === 'GET' && url.pathname.startsWith('/texfiles/')) {
+      return json(res, readUploadedTexFile(decodeURIComponent(url.pathname.slice('/texfiles/'.length))));
+    }
     if (req.method === 'POST' && url.pathname === '/texfiles') {
       const body = JSON.parse(await readBody(req));
       const saved = saveUploadedTexFile(body);

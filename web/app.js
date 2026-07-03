@@ -50,6 +50,8 @@ const codeInsertButton = document.getElementById('code-insert');
 const codeFileInputEl = document.getElementById('code-file-input');
 const codeFilePickButton = document.getElementById('code-file-pick');
 const codePickedFileEl = document.getElementById('code-picked-file');
+const codeFilePreviewMetaEl = document.getElementById('code-file-preview-meta');
+const codeFilePreviewBodyEl = document.getElementById('code-file-preview-body');
 const codeFileKindEl = document.getElementById('code-file-kind');
 const codeFileTargetEl = document.getElementById('code-file-target');
 const codeFileIntegrateButton = document.getElementById('code-file-integrate');
@@ -2693,6 +2695,14 @@ function readTextFile(file) {
   });
 }
 
+function renderCodeFilePreview(meta, text, error = '') {
+  if (codeFilePreviewMetaEl) codeFilePreviewMetaEl.textContent = meta || '未選択';
+  if (codeFilePreviewBodyEl) {
+    codeFilePreviewBodyEl.textContent = error || text || 'ファイルを選択すると内容を確認できます。';
+    codeFilePreviewBodyEl.classList.toggle('has-error', !!error);
+  }
+}
+
 async function uploadTexFile(name, text) {
   const res = await fetch('/texfiles', {
     method: 'POST',
@@ -2732,6 +2742,22 @@ function setSelectedCodeFile(selection) {
     codePickedFileEl.textContent = selection?.path || codeFileInputEl?.files?.[0]?.name || '未選択';
   }
   renderCodeFileList(editor.value);
+}
+
+async function previewUploadedCodeFile(selection) {
+  if (!selection?.uploaded) {
+    renderCodeFilePreview(selection?.path || '', '', '');
+    return;
+  }
+  renderCodeFilePreview(selection.path, '読み込み中…');
+  try {
+    const res = await fetch(`/texfiles/${encodeURIComponent(selection.path)}`);
+    const payload = await res.json();
+    if (!res.ok || payload.error) throw new Error(payload.error || `HTTP ${res.status}`);
+    renderCodeFilePreview(`${payload.texPath} / ${payload.size} bytes`, payload.text || '');
+  } catch (err) {
+    renderCodeFilePreview(selection.path, '', `ファイルを読み込めませんでした: ${err.message}`);
+  }
 }
 
 async function integrateSelectedCodeFile() {
@@ -2795,6 +2821,13 @@ codeFileInputEl?.addEventListener('change', () => {
   const file = codeFileInputEl.files?.[0];
   selectedCodeFile = null;
   if (codePickedFileEl) codePickedFileEl.textContent = file ? file.name : '未選択';
+  if (file) {
+    readTextFile(file)
+      .then((text) => renderCodeFilePreview(`${file.name} / ${file.size} bytes`, text))
+      .catch((err) => renderCodeFilePreview(file.name, '', `ファイルを読み込めませんでした: ${err.message}`));
+  } else {
+    renderCodeFilePreview('', '');
+  }
   renderCodeFileList(editor.value);
 });
 codeFileListEl?.addEventListener('click', (ev) => {
@@ -2804,6 +2837,7 @@ codeFileListEl?.addEventListener('click', (ev) => {
   const uploaded = item.dataset.codeFileUploaded === 'true';
   setSelectedCodeFile({ path, uploaded, kind: item.dataset.codeFileKind || 'auto' });
   if (uploaded && codeFileInputEl) codeFileInputEl.value = '';
+  previewUploadedCodeFile(selectedCodeFile);
 });
 
 async function insertImageFigure() {
