@@ -71,8 +71,8 @@ const aiTargetEl = document.getElementById('ai-target');
 const aiDraftButton = document.getElementById('ai-draft');
 const aiInsertButton = document.getElementById('ai-insert');
 const aiResultEl = document.getElementById('ai-result');
+const aiDialogEl = document.getElementById('ai-dialog');
 const aiPdfPreviewEl = document.getElementById('ai-pdf-preview');
-const aiAssistantMessageEl = document.getElementById('ai-assistant-message');
 const aiLaneInputs = [...document.querySelectorAll('input[name="ai-lane"]')];
 const aiModeLabels = [...document.querySelectorAll('[data-ai-scope]')];
 const tableRowsEl = document.getElementById('table-rows');
@@ -136,6 +136,7 @@ let selectedWordBlockId = null;
 let activeWordTextarea = null;
 let customizeDirty = false;
 let aiDraft = null;
+let aiLastPrompt = '';
 let uploadedTexFiles = [];
 let tableData = [
   ['項目', '値', '備考'],
@@ -1712,18 +1713,45 @@ function updateAiLaneUi() {
     if (first) first.checked = true;
   }
   setAiCommandOptionsForLane(lane);
-  if (aiAssistantMessageEl) {
-    aiAssistantMessageEl.textContent =
-      lane === 'design'
-        ? '持ち込み.sty、独自マクロ、tcolorbox、柱などの意匠案を作り、サンプルを実コンパイルしたPDFで確認します。'
-        : '本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。';
-  }
+  document.getElementById('ai-assistant-message')?.replaceChildren(document.createTextNode(aiIntroText(lane)));
   if (aiPromptEl) {
     aiPromptEl.placeholder =
       lane === 'design'
         ? '例: 注意書き用の角丸tcolorboxを作りたい / uploads/my-style.sty を使いたい'
         : '追加・整理したい本文を入力';
   }
+}
+
+function aiIntroText(lane = selectedAiLane()) {
+  return lane === 'design'
+    ? '持ち込み.sty、独自マクロ、tcolorbox、柱などの意匠案を作り、サンプルを実コンパイルしたPDFで確認します。'
+    : '本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。';
+}
+
+function renderAiConversation(draft = null) {
+  if (!aiDialogEl) return;
+  const intro = aiIntroText();
+  if (!draft) {
+    aiDialogEl.innerHTML = `<div class="ai-message ai-message-assistant" id="ai-assistant-message">${escapeHtml(intro)}</div>`;
+    return;
+  }
+  const scope = isAiDesignDraft(draft) ? 'design' : 'body';
+  const previewLabel = scope === 'design' ? '実コンパイルPDFで確認' : '擬似PDFへ追加';
+  const destinationLabel = draft.preambleOnly ? 'プリアンブル' : scope === 'design' ? 'プリアンブル＋サンプル' : '本文';
+  const packageChips = (draft.packages ?? []).map((name) => `<span class="ai-chip">\\usepackage{${escapeHtml(name)}}</span>`).join('');
+  aiDialogEl.innerHTML = `
+    <div class="ai-message ai-message-assistant">${escapeHtml(intro)}</div>
+    <div class="ai-message ai-message-user">${escapeHtml(aiLastPrompt || '新しい内容')}</div>
+    <div class="ai-message ai-message-assistant ai-message-draft">
+      <div class="ai-message-title">${escapeHtml(draft.title)}</div>
+      <div class="ai-message-body">${escapeHtml(draft.preview)}</div>
+      <div class="ai-chip-row">
+        <span class="ai-chip">${escapeHtml(destinationLabel)}</span>
+        <span class="ai-chip">${escapeHtml(previewLabel)}</span>
+        ${packageChips}
+      </div>
+    </div>
+  `;
 }
 
 function switchAiLane(lane) {
@@ -1757,6 +1785,26 @@ function selectedAiCommand(mode, prompt) {
   return 'paragraph';
 }
 
+function aiModeForCommand(command, fallback = selectedAiMode()) {
+  if (command === 'style-package') return 'sty-integration';
+  if (command === 'macro') return 'macro-design';
+  if (command === 'tcolorbox') return 'box-design';
+  if (command === 'page-style') return 'page-style';
+  if (command === 'section' || command === 'subsection') return 'structure';
+  return fallback;
+}
+
+function syncAiModeToCommand(command) {
+  const mode = aiModeForCommand(command);
+  const input = document.querySelector(`input[name="ai-mode"][value="${mode}"]`);
+  if (input) {
+    input.checked = true;
+    const laneInput = document.querySelector(`input[name="ai-lane"][value="${aiModeScope(mode)}"]`);
+    if (laneInput) laneInput.checked = true;
+    updateAiLaneUi();
+  }
+}
+
 function renderAiDraft(draft) {
   if (!aiResultEl) return;
   if (!draft) {
@@ -1764,14 +1812,16 @@ function renderAiDraft(draft) {
     aiResultEl.textContent = '候補はまだありません';
     aiInsertButton.disabled = true;
     renderAiPdfPreview(null);
+    renderAiConversation(null);
     return;
   }
-  aiResultEl.className = 'ai-result';
+  aiResultEl.className = 'ai-result ai-draft-card';
   aiResultEl.innerHTML = `
-    <div class="ai-result-title">${escapeHtml(draft.title)}</div>
-    <div class="ai-result-body">${escapeHtml(draft.preview)}</div>
+    <div class="ai-result-title">生成されるTeX</div>
+    <div class="ai-result-body">${escapeHtml(draft.preambleTex ? `${draft.preambleTex}\n${draft.tex || ''}` : draft.tex || draft.previewTex || draft.preview)}</div>
   `;
   aiInsertButton.disabled = false;
+  renderAiConversation(draft);
 }
 
 function renderAiPdfPreview(state) {
@@ -1828,9 +1878,9 @@ async function compileAiPdfPreview(draft) {
   }
 }
 
-function buildAiDraft(mode, prompt) {
+function buildAiDraft(mode, prompt, commandOverride = null) {
   const text = prompt.trim() || '新しい内容';
-  const command = selectedAiCommand(mode, text);
+  const command = commandOverride || selectedAiCommand(mode, text);
   const title = text.split(/[。.\n]/)[0].replace(/^[-*>0-9.)\s]+/, '').trim().slice(0, 48) || '新しい項目';
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const listItems = lines
@@ -2082,7 +2132,10 @@ function insertAiDraft() {
 }
 
 aiDraftButton?.addEventListener('click', async () => {
-  aiDraft = buildAiDraft(selectedAiMode(), aiPromptEl.value);
+  aiLastPrompt = aiPromptEl.value.trim() || '新しい内容';
+  const command = selectedAiCommand(selectedAiMode(), aiLastPrompt);
+  syncAiModeToCommand(command);
+  aiDraft = buildAiDraft(selectedAiMode(), aiLastPrompt, command);
   renderAiDraft(aiDraft);
   await compileAiPdfPreview(aiDraft);
 });

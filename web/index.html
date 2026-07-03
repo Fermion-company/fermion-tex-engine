@@ -445,7 +445,7 @@
           <label data-ai-scope="design"><input type="radio" name="ai-mode" value="box-design"> tcolorbox</label>
           <label data-ai-scope="design"><input type="radio" name="ai-mode" value="page-style"> 柱・版面</label>
         </div>
-        <div class="ai-dialog">
+        <div class="ai-dialog" id="ai-dialog">
           <div class="ai-message ai-message-assistant" id="ai-assistant-message">本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。</div>
         </div>
         <div class="insert-grid ai-body-controls">
@@ -484,7 +484,7 @@
           <button id="ai-insert" type="button" disabled>文書に追加</button>
         </div>
         <div id="ai-pdf-preview" class="ai-pdf-preview is-hidden" aria-live="polite"></div>
-        <div id="ai-result" class="ai-result" aria-live="polite"></div>
+        <div id="ai-result" class="ai-result ai-draft-card" aria-live="polite"></div>
       </div>
     </div>
     <div class="workspace-panel" data-panel="code">
