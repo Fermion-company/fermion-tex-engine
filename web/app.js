@@ -321,24 +321,29 @@ function lineColToOffset(text, line, col) {
 let zoom = Number(localStorage.getItem('tdom-zoom')) || 1;
 
 function setZoom(z) {
-  zoom = Math.min(3, Math.max(0.4, Math.round(z * 20) / 20));
+  zoom = Math.min(3, Math.max(0.4, Math.round(z * 100) / 100));
   pagesEl.style.setProperty('--zoom', zoom);
   document.getElementById('zoom-level').textContent = Math.round(zoom * 100) + '%';
   localStorage.setItem('tdom-zoom', String(zoom));
 }
 
-document.getElementById('zoom-in').addEventListener('click', () => setZoom(zoom * 1.15));
-document.getElementById('zoom-out').addEventListener('click', () => setZoom(zoom / 1.15));
+document.getElementById('zoom-in').addEventListener('click', () => setZoom(zoom * 1.1));
+document.getElementById('zoom-out').addEventListener('click', () => setZoom(zoom / 1.1));
 document.getElementById('zoom-fit').addEventListener('click', () => setZoom(1));
 
 // PDF-viewer convention: Ctrl/Cmd + wheel (and trackpad pinch, which the
-// browser reports as a ctrlKey wheel) zooms the document.
+// browser reports as a ctrlKey wheel) zooms the document. The factor is
+// proportional to the wheel delta: pinch gestures emit many small deltas,
+// so a fixed per-event step feels far too aggressive.
 pagesEl.addEventListener(
   'wheel',
   (ev) => {
     if (!ev.ctrlKey && !ev.metaKey) return;
     ev.preventDefault();
-    setZoom(zoom * (ev.deltaY < 0 ? 1.08 : 1 / 1.08));
+    let dy = ev.deltaY;
+    if (ev.deltaMode === 1) dy *= 16; // line mode -> approx pixels
+    const factor = Math.min(1.2, Math.max(1 / 1.2, Math.exp(-dy * 0.0022)));
+    setZoom(zoom * factor);
   },
   { passive: false }
 );
