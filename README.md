@@ -2,10 +2,13 @@
 
 A **resident, incremental TeX/LaTeX typesetting runtime**: the engine keeps
 the whole document state alive between keystrokes and turns source diffs into
-display-list patches. With a TeX installation present, typesetting is done by
-**real LuaLaTeX, one block at a time** — sentence and math edits update the
-preview in ~0.4 s while untouched blocks, pages and chunks are reused from
-cache. No TeX installed? It falls back to a built-in zero-dependency engine.
+display-list patches. With a TeX installation present, the default backend is
+a **fork-checkpointed resident LuaLaTeX**: every block boundary is a
+copy-on-write process snapshot of the complete TeX state, an edit resumes
+from the nearest snapshot, and the preview is painted from TeX's own glyph
+positions with TeX's own font files — measured **keystroke-to-patched-page
+latency: ~29 ms** (typesetting itself: 4–14 ms). No TeX installed? It falls
+back to a built-in zero-dependency engine.
 
 ## Quick start
 
@@ -53,9 +56,40 @@ npm test         # 内部エンジン10本 + lualatex統合8本のテスト
 ブラウザで `http://127.0.0.1:4633` を開くと、
 **エディタ / プレビュー / Engine Inspector** の3ペインが表示されます。
 
-## 2つのバックエンド
+## 3つのバックエンド
 
-### 1. lualatexバックエンド（TeX Live検出時のデフォルト）
+### 0. checkpointバックエンド（TeX Live検出時のデフォルト）— 理論限界
+
+**fork()チェックポイント式の常駐lualatex。** エンジンプロセスは一度も再起動せず、
+全ブロック境界がfork()による**完全なTeX状態のスナップショット**（コピーオンライト）
+として常駐します。編集は直近のチェックポイントから再開され、キーストロークの
+表側コストは：
+
+```text
+fork (0.2ms) + 変更ブロックのKnuth-Plass組版 (1-5ms) + 収束検証1ブロック
++ ノードリスト直接抽出 + ローカルソケットJSON
+= 実測 組版3.7-14ms / キー入力→画面パッチ 29ms
+```
+
+ホットパスには**プロセス起動もプリアンブル再処理もフォント再ロードもPDFも
+外部変換も存在しません**。表示リストはTeX自身のグリフ座標（node listから抽出、
+`node.effective_glue`で厳密位置）を運び、ブラウザは**TeXが使ったのと同じ
+フォントファイル**（@font-face配信、カーニング/リガチャはTeX側で確定済みなので
+ブラウザ整形は無効化）で描画します。数式のレガシーCM Type1フォントは
+Latin Modern OTF双子＋スロット対応表（OML/OMS/OMX/OT1）で置換し、
+cmexの大型グリフを含むブロックとTikZ等のPDFリテラルを含むブロックは
+**精密レンダー層**（レンダー子プロセスが実PDFを出荷→SVG化→非同期スワップ）が
+最終的な厳密表示を保証します。
+
+- 実装: `engine/checkpoint/`（60行のCシム `tdomfork.c` + TeX内デーモン
+  `daemon.lua` + オーケストレータ `engine-v3.js`）。lualatex本体は無改造。
+- カウンタ・ラベルは**TeX実行の実値**を使用。`\label`はチェーン内で
+  `token.set_macro`により即時定義され、参照が編集に追随。
+- 式の挿入 → カウンタ連鎖で下流だけ再組版（実測52ms/15ブロック）
+- プリアンブル変更 → 正直なフル再構築（ルート再起動 ~1秒）
+- 収束判定は「1ブロック余分に組版して出力一致を確認」する自己検証型
+
+### 1. lualatexバックエンド（`TDOM_BACKEND=lualatex`）
 
 **本物のLuaLaTeXを組版エンジンとして使い、ブロック単位で差分再組版**します。
 Knuth-Plass行分割・Latin Modernフォント・amsmath・amsthm・TikZ・booktabsが

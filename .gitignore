@@ -1,2 +1,4 @@
 .tdom-cache*/
+.tdom-v3*/
+.tdom-dbg/
 node_modules/

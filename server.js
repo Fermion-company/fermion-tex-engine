@@ -1,10 +1,12 @@
 // Resident engine server.
 //
 // The TDOM engine lives in this process, holding the full document state
-// between requests. Two interchangeable engines:
-//   - lualatex backend (default when a TeX installation is detected):
-//     real LuaLaTeX typesetting, incremental per block
-//   - internal backend: the zero-dependency toy engine (TDOM_BACKEND=internal)
+// between requests. Three interchangeable engines (TDOM_BACKEND=...):
+//   - checkpoint (default with TeX installed): fork-checkpointed resident
+//     lualatex — keystroke-synchronous live preview (~5ms edits) drawing
+//     TeX's own glyphs with TeX's own fonts
+//   - lualatex: per-block isolated compiles (v1 architecture)
+//   - internal: the zero-dependency toy engine
 //
 // Clients are thin: the editor POSTs text deltas, the viewer applies
 // display-list patches (from the POST response and/or the SSE stream).
@@ -16,6 +18,7 @@ import path from 'node:path';
 import { TDOMEngine } from './engine/engine.js';
 import { LuaTDOMEngine } from './engine/engine-lua.js';
 import { LuaTexBackend } from './engine/luatex/backend.js';
+import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import { PAGE } from './engine/layout.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -23,7 +26,15 @@ const PORT = Number(process.env.PORT || 4633);
 
 async function createEngine() {
   const pref = process.env.TDOM_BACKEND;
-  if (pref !== 'internal' && (await LuaTexBackend.detect())) {
+  const texAvailable = await LuaTexBackend.detect();
+  if (pref === 'internal' || !texAvailable) {
+    return {
+      engine: new TDOMEngine(),
+      backend: 'internal',
+      sample: readFileSync(path.join(ROOT, 'samples', 'demo.tex'), 'utf8'),
+    };
+  }
+  if (pref === 'lualatex') {
     return {
       engine: new LuaTDOMEngine({ workDir: path.join(ROOT, '.tdom-cache') }),
       backend: 'lualatex',
@@ -31,9 +42,9 @@ async function createEngine() {
     };
   }
   return {
-    engine: new TDOMEngine(),
-    backend: 'internal',
-    sample: readFileSync(path.join(ROOT, 'samples', 'demo.tex'), 'utf8'),
+    engine: new CheckpointEngine({ workDir: path.join(ROOT, '.tdom-v3') }),
+    backend: 'checkpoint',
+    sample: readFileSync(path.join(ROOT, 'samples', 'demo-lua.tex'), 'utf8'),
   };
 }
 
@@ -56,6 +67,13 @@ const sseClients = new Set();
 function broadcast(payload) {
   const data = `data: ${JSON.stringify(payload)}\n\n`;
   for (const res of sseClients) res.write(data);
+}
+
+// async patches (TikZ renders, late chain discoveries) from the checkpoint engine
+if (backend === 'checkpoint') {
+  engine.onAsyncPatches = (partial) => {
+    broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
+  };
 }
 
 const MIME = {
@@ -92,11 +110,9 @@ function readBody(req) {
 }
 
 function geometry() {
-  if (backend === 'lualatex') {
-    const g = engine.getGeometry();
-    return { paperwidth: g.paperwidth, paperheight: g.paperheight };
-  }
-  return { paperwidth: PAGE.width, paperheight: PAGE.height };
+  if (backend === 'internal') return { paperwidth: PAGE.width, paperheight: PAGE.height };
+  const g = engine.getGeometry();
+  return g;
 }
 
 function docPayload() {
@@ -105,6 +121,7 @@ function docPayload() {
     source: engine.getSource(),
     pages: engine.getDisplayLists(),
     geometry: geometry(),
+    fonts: backend === 'checkpoint' ? engine.getFontManifest() : [],
     report: lastReport,
   };
 }
@@ -120,16 +137,30 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/dom') return json(res, engine.getDOM());
     if (req.method === 'GET' && url.pathname.startsWith('/chunk/')) {
       const id = url.pathname.slice('/chunk/'.length).replace(/\.svg$/, '');
-      const svg = backend === 'lualatex' ? engine.getChunkSVG(id) : null;
+      const svg = engine.getChunkSVG ? engine.getChunkSVG(id) : null;
       if (!svg) {
         res.writeHead(404);
         return res.end('unknown chunk');
       }
       res.writeHead(200, {
         'Content-Type': 'image/svg+xml',
-        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Cache-Control': 'no-cache', // chunk content changes under a stable block id
       });
       return res.end(svg);
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/font/')) {
+      const key = decodeURIComponent(url.pathname.slice('/font/'.length));
+      const body = engine.getFontFile ? engine.getFontFile(key) : null;
+      if (!body) {
+        res.writeHead(404);
+        return res.end('unknown font');
+      }
+      const type = key.endsWith('.ttf') ? 'font/ttf' : 'font/otf';
+      res.writeHead(200, {
+        'Content-Type': type,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      });
+      return res.end(body);
     }
     if (req.method === 'GET' && url.pathname === '/pdf') {
       const pdf = await withEngine(() => engine.exportPDF());
@@ -181,4 +212,13 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[tdom] Fermion TeX Engine (${backend}) listening on http://127.0.0.1:${PORT}`);
+});
+
+process.on('SIGINT', async () => {
+  if (engine.close) await engine.close();
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  if (engine.close) await engine.close();
+  process.exit(0);
 });

@@ -24,6 +24,22 @@ const FONT_FAMILY = {
 
 let geometry = { paperwidth: 612, paperheight: 792 };
 let backend = 'internal';
+const loadedFonts = new Set();
+
+function injectFonts(keys) {
+  const missing = (keys ?? []).filter((k) => !loadedFonts.has(k));
+  if (!missing.length) return;
+  const css = missing
+    .map(
+      (k) =>
+        `@font-face{font-family:'${k}';src:url('/font/${encodeURIComponent(k)}');font-display:block;}`
+    )
+    .join('\n');
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+  for (const k of missing) loadedFonts.add(k);
+}
 let serverText = '';
 let appliedRev = 0;
 let composing = false;
@@ -48,6 +64,7 @@ async function boot() {
 function adoptDoc(doc) {
   geometry = doc.geometry;
   backend = doc.backend ?? 'internal';
+  injectFonts(doc.fonts);
   serverText = doc.source;
   editor.value = doc.source;
   pagesEl.textContent = '';
@@ -74,10 +91,28 @@ function renderPage(dl, flash) {
   }
   div.querySelector('svg')?.remove();
   div.querySelector('.sheet')?.remove();
+  div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
 
-  const hasChunks = dl.commands.some((c) => c.op === 'chunk' || c.op === 'folio');
-  if (hasChunks) div.insertAdjacentHTML('beforeend', chunkSheet(dl));
-  else div.insertAdjacentHTML('beforeend', svgFor(dl));
+  // checkpoint / internal display lists carry glyph runs -> unified SVG
+  // plus absolutely-positioned <img> overlays for exact-render chunks;
+  // lualatex (v1) pages are chunk-image compositions -> HTML sheet
+  const hasGlyphs = dl.commands.some((c) => c.op === 'glyphs');
+  if (hasGlyphs || backend !== 'lualatex') {
+    div.insertAdjacentHTML('beforeend', svgFor(dl));
+    for (const cmd of dl.commands) {
+      if (cmd.op !== 'chunk') continue;
+      const W = geometry.paperwidth;
+      const H = geometry.paperheight;
+      const shiftPct = (cmd.sy / cmd.w) * 100; // margin-top % is width-relative
+      div.insertAdjacentHTML(
+        'beforeend',
+        `<div class="chunkwin" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+          `<img class="chunk" src="/chunk/${cmd.chunk}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+      );
+    }
+  } else {
+    div.insertAdjacentHTML('beforeend', chunkSheet(dl));
+  }
 
   if (flash) {
     div.classList.remove('fading');
@@ -115,21 +150,35 @@ function chunkSheet(dl) {
   return parts.join('');
 }
 
-/** internal mode: engine-positioned glyph runs as SVG text. */
+/** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
 function svgFor(dl) {
   const parts = [
-    `<svg viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg">`,
+    `<svg viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
   for (const cmd of dl.commands) {
     if (cmd.op === 'glyphs') {
-      const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
-      const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
+      let fontAttrs;
+      if (cmd.fam) {
+        // checkpoint backend: real TeX font, TeX positions; disable browser
+        // shaping so run-start x + font advances reproduce TeX exactly
+        fontAttrs = ` font-family="${escapeXml(cmd.fam)}" style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
+      } else {
+        const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
+        const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
+        fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
+      }
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}" font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b} fill="#1a1a1a" data-src="${cmd.src}" xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}" xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
     } else if (cmd.op === 'rule') {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="#1a1a1a" data-src="${cmd.src}"/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"/>`
+      );
+    } else if (cmd.op === 'chunk') {
+      // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
+    } else if (cmd.op === 'folio') {
+      parts.push(
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="10" font-family="${FONT_FAMILY.regular}" fill="#1a1a1a" text-anchor="middle">${escapeXml(cmd.text)}</text>`
       );
     }
   }
@@ -172,8 +221,15 @@ function diffText(oldStr, newStr) {
 }
 
 function scheduleSync() {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(flushSync, backend === 'lualatex' ? 300 : 30);
+  if (backend === 'lualatex') {
+    // per-block compiles cost ~0.5s: coalesce keystrokes
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(flushSync, 300);
+    return;
+  }
+  // checkpoint/internal engines absorb every keystroke: send immediately —
+  // the serialized `sending` chain coalesces bursts into single diffs
+  flushSync();
 }
 
 function flushSync() {
@@ -197,9 +253,11 @@ function flushSync() {
       applyReport(report);
       renderInspector(report, rtt);
       const engineMs =
-        backend === 'lualatex'
-          ? `lualatex ${report.stats.lualatexMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
-          : `engine ${fmtUs(report.stats.totalUs)}`;
+        backend === 'checkpoint'
+          ? `組版 ${report.stats.typesetMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
+          : backend === 'lualatex'
+            ? `lualatex ${report.stats.lualatexMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
+            : `engine ${fmtUs(report.stats.totalUs)}`;
       statusEl.textContent =
         `update #${report.rev} [${backend}] — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
         (report.dirtyPages.length
@@ -317,7 +375,18 @@ function renderInspector(report, rtt) {
   }
 
   const isLua = backend === 'lualatex';
-  const cacheRows = isLua
+  const isCkpt = backend === 'checkpoint';
+  const cacheRows = isCkpt
+    ? `
+        <span class="k">ブロック総数</span><span class="v">${s.blocksTotal}</span>
+        <span class="k">fork再開組版</span><span class="v">${s.blocksTypeset}</span>
+        <span class="k">ブロック再利用</span><span class="v good">${s.blocksTotal - s.blocksTypeset}</span>
+        <span class="k">組版時間 (実TeX)</span><span class="v good">${s.typesetMs} ms</span>
+        <span class="k">常駐チェックポイント</span><span class="v">${s.checkpoints}</span>
+        <span class="k">フル再構築</span><span class="v">${s.rebooted ? 'あり（プリアンブル変更）' : 'なし'}</span>
+        <span class="k">ページ再利用</span><span class="v good">${s.pagesReused} / ${s.pageCount}</span>
+        <span class="k">ページ再構築</span><span class="v">${s.pagesRebuilt}</span>`
+    : isLua
     ? `
         <span class="k">ブロック総数</span><span class="v">${s.blocksTotal}</span>
         <span class="k">lualatex再コンパイル</span><span class="v">${s.blocksCompiled}</span>
@@ -339,7 +408,7 @@ function renderInspector(report, rtt) {
 
   inspectorEl.innerHTML = `
     <div class="card">
-      <div class="bigtime">${fmtUs(s.totalUs)} <span class="unit">${isLua ? 'lualatex backend' : 'internal engine'}${rtt != null ? ` / 往復 ${rtt.toFixed(0)} ms` : ''}</span></div>
+      <div class="bigtime">${fmtUs(s.totalUs)} <span class="unit">${isCkpt ? 'checkpoint engine (常駐TeX)' : isLua ? 'lualatex backend' : 'internal engine'}${rtt != null ? ` / 往復 ${rtt.toFixed(0)} ms` : ''}</span></div>
       <div class="editlabel">edit: ${escapeHtml(report.edit)} (rev ${report.rev})</div>
     </div>
 
@@ -420,6 +489,17 @@ const sse = new EventSource('/events');
 sse.onmessage = (ev) => {
   try {
     const msg = JSON.parse(ev.data);
+    if (msg.kind === 'patches') {
+      // async arrivals (TikZ exact renders, background chain discoveries)
+      if (msg.rev > appliedRev) {
+        appliedRev = msg.rev;
+        for (const patch of msg.patches) {
+          if (patch.type === 'replace-page') renderPage(patch.displayList, true);
+          else if (patch.type === 'remove-pages') removePagesFrom(patch.from);
+        }
+      }
+      return;
+    }
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {
       applyReport(msg.report);
       renderInspector(msg.report, null);
