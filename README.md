@@ -32,6 +32,13 @@ Requirements:
 Run the test suite with `npm test` (the LuaLaTeX integration tests skip
 automatically when no TeX installation is found).
 
+**Full implementation guide (Japanese):** [docs/](docs/README.md) —
+a 7-chapter walkthrough of the entire codebase, written for readers
+without prior TeX internals knowledge: how TeX engines are built, what we
+changed and (crucially) what we did not, the fork-checkpoint architecture
+down to the wire protocol, the font pipeline, and an archive of all 18
+implementation traps we hit.
+
 ---
 
 TeX / LaTeX互換の入力を受け取り、**文書状態を常駐保持**し、**ソース変更差分から表示差分を生成**する、
