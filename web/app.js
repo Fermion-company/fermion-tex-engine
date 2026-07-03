@@ -557,31 +557,6 @@ document.getElementById('btn-reset').addEventListener('click', async () => {
   statusEl.textContent = 'サンプル文書に戻しました';
 });
 
-document.getElementById('btn-macro').addEventListener('click', () => {
-  const a = '\\newcommand{\\term}[1]{\\textbf{#1}}';
-  const b = '\\newcommand{\\term}[1]{\\emph{#1}}';
-  toggleInEditor(a, b);
-});
-
-document.getElementById('btn-label').addEventListener('click', () => {
-  for (const key of ['sec:live', 'sec:intro']) {
-    const a = `\\label{${key}}`;
-    const b = `\\label{${key}-renamed}`;
-    if (editor.value.includes(a) || editor.value.includes(b)) {
-      toggleInEditor(a, b);
-      return;
-    }
-  }
-});
-
-function toggleInEditor(a, b) {
-  const v = editor.value;
-  if (v.includes(a)) editor.value = v.replace(a, b);
-  else if (v.includes(b)) editor.value = v.replace(b, a);
-  else return;
-  scheduleSync();
-}
-
 // ---------------------------------------------------------------- inspector
 
 function fmtUs(us) {
