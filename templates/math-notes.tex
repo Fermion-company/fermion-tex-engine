@@ -1,0 +1,94 @@
+%% name: Math Notes
+%% desc: 数学ノート — 定理環境群・align・行列・場合分け・番号参照
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\begin{document}
+
+\tableofcontents
+
+\section{Definitions}
+
+\begin{definition}[Norm]
+  \label{def:norm}
+  A \emph{norm} on a vector space $V$ is a map
+  $\lVert\cdot\rVert : V \to \mathbb{R}_{\ge 0}$ satisfying
+  \begin{align}
+    \lVert x \rVert &= 0 \iff x = 0, \label{eq:norm-zero}\\
+    \lVert \lambda x \rVert &= |\lambda|\,\lVert x \rVert, \\
+    \lVert x + y \rVert &\le \lVert x \rVert + \lVert y \rVert.
+    \label{eq:triangle}
+  \end{align}
+\end{definition}
+
+\begin{example}
+  On $\mathbb{R}^n$, the $p$-norms
+  $\lVert x \rVert_p = \bigl(\sum_{i=1}^n |x_i|^p\bigr)^{1/p}$
+  satisfy Definition~\ref{def:norm}; the case $p=2$ is Euclidean.
+\end{example}
+
+\section{Main Results}
+
+\begin{lemma}
+  \label{lem:cs}
+  For all $x, y \in \mathbb{R}^n$,
+  $\bigl|\langle x, y\rangle\bigr| \le \lVert x\rVert_2\,\lVert y\rVert_2$.
+\end{lemma}
+
+\begin{theorem}
+  \label{thm:main}
+  Every inner product space is a normed space under
+  $\lVert x \rVert = \sqrt{\langle x, x\rangle}$.
+\end{theorem}
+
+\begin{proof}
+  Properties \eqref{eq:norm-zero}--\eqref{eq:triangle} follow from
+  bilinearity and Lemma~\ref{lem:cs}:
+  \[
+    \lVert x+y \rVert^2
+      = \lVert x\rVert^2 + 2\langle x,y\rangle + \lVert y\rVert^2
+      \le \bigl(\lVert x\rVert + \lVert y\rVert\bigr)^2. \qedhere
+  \]
+\end{proof}
+
+\begin{remark}
+  Insert a new numbered equation above and watch every later number and
+  every reference below renumber live.
+\end{remark}
+
+\section{Worked Computation}
+
+Piecewise definitions and matrices typeset exactly as in print:
+
+\[
+  f(x) =
+  \begin{cases}
+    x^2 \sin\frac{1}{x} & x \neq 0,\\
+    0 & x = 0,
+  \end{cases}
+  \qquad
+  A =
+  \begin{pmatrix}
+    1 & 2 \\
+    3 & 4
+  \end{pmatrix},
+  \qquad
+  \det A = -2.
+\]
+
+By Theorem~\ref{thm:main} together with \eqref{eq:triangle}, the sequence
+$x_k = \sum_{j=1}^{k} 2^{-j} e_j$ is Cauchy, hence convergent.
+
+\end{document}

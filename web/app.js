@@ -309,6 +309,45 @@ function lineColToOffset(text, line, col) {
 
 // ---------------------------------------------------------------- buttons
 
+// Template picker: start a fresh document from templates/*.tex
+async function loadTemplateList() {
+  try {
+    const list = await fetch('/templates').then((r) => r.json());
+    const sel = document.getElementById('tpl-select');
+    for (const t of list) {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      opt.textContent = t.name;
+      opt.title = t.desc;
+      sel.appendChild(opt);
+    }
+    const demo = document.createElement('option');
+    demo.value = '__demo';
+    demo.textContent = 'デモ文書';
+    sel.appendChild(demo);
+  } catch {
+    /* templates are optional */
+  }
+}
+
+document.getElementById('tpl-select').addEventListener('change', async (ev) => {
+  const id = ev.target.value;
+  ev.target.value = '';
+  if (!id) return;
+  if (!confirm('現在の内容を破棄してテンプレートから新規作成しますか？')) return;
+  const body = id === '__demo' ? '{}' : JSON.stringify({ template: id });
+  const res = await fetch('/open', { method: 'POST', body });
+  const doc = await res.json();
+  if (doc.error) {
+    statusEl.textContent = `エラー: ${doc.error}`;
+    return;
+  }
+  adoptDoc(doc);
+  history.length = 0;
+  renderInspector(doc.report, null);
+  statusEl.textContent = `テンプレート「${id}」から開始 — ${doc.report.stats.pageCount} pages`;
+});
+
 document.getElementById('btn-pdf').addEventListener('click', () => {
   statusEl.textContent = backend === 'lualatex' ? 'PDF生成中（フルコンパイル）…' : 'PDF生成中…';
   window.open('/pdf', '_blank');
@@ -520,3 +559,4 @@ sse.onmessage = (ev) => {
 };
 
 boot();
+loadTemplateList();

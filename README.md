@@ -13,11 +13,20 @@ back to a built-in zero-dependency engine.
 ## Quick start
 
 ```bash
-git clone https://github.com/heavyinthegame/fermion-tex-engine.git
+git clone https://github.com/Fermion-company/fermion-tex-engine.git
 cd fermion-tex-engine
 npm start        # no npm install needed — zero dependencies
 # open http://127.0.0.1:4633
 ```
+
+Pick a starter from the **template selector** in the header
+(`templates/*.tex`): an English academic article, a Japanese article
+(luatexja, real kinsoku line breaking), math notes (theorem environments,
+align, matrices) or a minimal skeleton — each preloaded with a table of
+contents, numbered math, floats, footnotes, cross-references and a
+bibliography so every live feature is one edit away. Adding your own
+template is just dropping a `.tex` file with a `%% name:` header into
+`templates/`.
 
 Requirements:
 

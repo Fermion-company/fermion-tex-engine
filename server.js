@@ -12,7 +12,7 @@
 // display-list patches (from the POST response and/or the SSE stream).
 
 import http from 'node:http';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { TDOMEngine } from './engine/engine.js';
@@ -23,6 +23,35 @@ import { PAGE } from './engine/layout.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
+
+const TEMPLATES_DIR = path.join(ROOT, 'templates');
+
+function listTemplates() {
+  const out = [];
+  try {
+    for (const f of readdirSync(TEMPLATES_DIR)) {
+      if (!f.endsWith('.tex')) continue;
+      const id = f.slice(0, -4);
+      const head = readFileSync(path.join(TEMPLATES_DIR, f), 'utf8').slice(0, 400);
+      const name = head.match(/^%% name:\s*(.+)$/m)?.[1]?.trim() ?? id;
+      const desc = head.match(/^%% desc:\s*(.+)$/m)?.[1]?.trim() ?? '';
+      out.push({ id, name, desc });
+    }
+  } catch {
+    /* no templates dir */
+  }
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return out;
+}
+
+function readTemplate(id) {
+  if (!/^[a-z0-9-]+$/i.test(id)) return null;
+  try {
+    return readFileSync(path.join(TEMPLATES_DIR, id + '.tex'), 'utf8');
+  } catch {
+    return null;
+  }
+}
 
 async function createEngine() {
   const pref = process.env.TDOM_BACKEND;
@@ -144,6 +173,7 @@ const server = http.createServer(async (req, res) => {
       return serveStatic(res, url.pathname.slice(1));
     }
     if (req.method === 'GET' && url.pathname === '/doc') return json(res, docPayload());
+    if (req.method === 'GET' && url.pathname === '/templates') return json(res, listTemplates());
     if (req.method === 'GET' && url.pathname === '/dom') return json(res, engine.getDOM());
     if (req.method === 'GET' && url.pathname.startsWith('/chunk/')) {
       const id = url.pathname.slice('/chunk/'.length).replace(/\.svg$/, '');
@@ -207,6 +237,11 @@ const server = http.createServer(async (req, res) => {
       if (raw) {
         const body = JSON.parse(raw);
         if (typeof body.text === 'string') text = body.text;
+        else if (typeof body.template === 'string') {
+          const t = readTemplate(body.template);
+          if (t == null) return json(res, { error: 'unknown template' }, 404);
+          text = t;
+        }
       }
       lastReport = await withEngine(() => engine.open(text));
       broadcast({ kind: 'reset' });
