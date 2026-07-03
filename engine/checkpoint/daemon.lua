@@ -30,6 +30,11 @@ local blk_labels = {}
 local blk_refs = {}
 local blk_counters = {}
 local blk_gfx = false
+local blk_floats = {}
+local pending_fmarks = {}
+local geo_extra = {}
+local RENDER_MODE = false
+local FLOAT_COPIES = {}
 
 local SP2BP = 65781.76
 local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000 + 0.5) / 1000 end
@@ -91,7 +96,7 @@ function tdom_geo()
     local ok, v = pcall(function() return tex.dimen[name] end)
     return ok and bp(v or 0) or 0
   end
-  local payload = jenc({
+  local geo = {
     paperwidth = dim('paperwidth'),
     paperheight = dim('paperheight'),
     textwidth = dim('textwidth'),
@@ -104,7 +109,9 @@ function tdom_geo()
     lineskip = bp(tex.lineskip.width or 0),
     parskip = bp(tex.parskip.width or 0),
     parindent = bp(tex.parindent or 0),
-  })
+  }
+  for k, v in pairs(geo_extra) do geo[k] = v end
+  local payload = jenc(geo)
   conn:send('GEO ' .. #payload .. '\n')
   conn:send(payload)
 end
@@ -155,6 +162,28 @@ function tdom_counter(name, value)
   blk_counters[name] = tonumber(value) or 0
 end
 
+function tdom_cites(keys)
+  for k in keys:gmatch('[^,%s]+') do
+    blk_refs[#blk_refs + 1] = 'cite:' .. k
+  end
+end
+
+function tdom_bib(key, value)
+  blk_labels[#blk_labels + 1] = { k = 'cite:' .. key, v = value }
+  pcall(function()
+    token.set_macro('b@' .. key, value, 'global')
+  end)
+end
+
+-- geometry extras collected before tdom_geo (skips/fractions from LaTeX)
+function tdom_dim(name, sp)
+  geo_extra[name] = bp(tonumber(sp) or 0)
+end
+
+function tdom_num(name, value)
+  geo_extra[name] = tonumber(value) or 0
+end
+
 -- ------------------------------------------------------- galley walking
 
 local GLYPH = node.id('glyph')
@@ -166,9 +195,22 @@ local KERN = node.id('kern')
 local PENALTY = node.id('penalty')
 local DISC = node.id('disc')
 local WHATSIT = node.id('whatsit')
+local INS = node.id('ins')
 
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
+local SPECIAL_SUB = node.subtype and node.subtype('special')
+
+local function check_special(n)
+  if SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data then
+    local fn = n.data:match('^tdomfloat:(%d+)$')
+    if fn then
+      pending_fmarks[#pending_fmarks + 1] = tonumber(fn)
+      return true
+    end
+  end
+  return false
+end
 
 local function note_font(fid)
   if fid and fid > 0 and not seen_fonts[fid] then
@@ -303,6 +345,8 @@ walk_h = function(head, parent, x0, dy0, out)
         end
       elseif LIT_SUB and n.subtype == LIT_SUB then
         blk_gfx = true
+      else
+        check_special(n)
       end
     end
     n = n.next
@@ -344,14 +388,14 @@ walk_v = function(box, x0, baseline_dy, out)
 end
 
 TDOM_BOXNUM = 254 -- overwritten by the driver right after \newbox\TDOMgalley
+TDOM_FLOATBOX = 253 -- overwritten after \newbox\TDOMfloatbox
 
--- Top level: the galley vbox -> vertical items with per-line runs.
-local function extract_galley()
-  local box = tex.box[TDOM_BOXNUM]
+-- Walk a vertical node list into items (lines with runs, glue, penalties,
+-- footnote inserts). Used for the block galley, float boxes and insert
+-- contents alike.
+local function extract_items(head, parentBox)
   local items = {}
-  if not box then return items, 0, 0, 0 end
-  colstack = {}
-  local n = box.list
+  local n = head
   while n do
     local id = n.id
     if id == HLIST or id == VLIST or id == RULE then
@@ -359,7 +403,7 @@ local function extract_galley()
       local d = n.depth or 0
       local w = n.width or 0
       if id == RULE then
-        if w < -1073741823 then w = box.width or 0 end
+        if w < -1073741823 then w = (parentBox and parentBox.width) or 0 end
         if h < -1073741823 then h = 26214 end
         if d < -1073741823 then d = 0 end
       end
@@ -371,17 +415,71 @@ local function extract_galley()
       else
         runs[1] = { rule = true, x = 0, dy = -bp(h), w = bp(w), h = bp(h) + bp(d), c = '#000000' }
       end
-      items[#items + 1] = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
+      local item = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
+      if #pending_fmarks > 0 then
+        item.fm = pending_fmarks
+        pending_fmarks = {}
+      end
+      items[#items + 1] = item
     elseif id == GLUE then
-      items[#items + 1] = { k = 'glue', a = bp(node.effective_glue(n, box) or n.width) }
+      items[#items + 1] = { k = 'glue', a = bp(node.effective_glue(n, parentBox) or n.width) }
     elseif id == KERN then
       items[#items + 1] = { k = 'kern', a = bp(n.kern or 0) }
     elseif id == PENALTY then
       items[#items + 1] = { k = 'pen', v = n.penalty or 0 }
+    elseif id == INS then
+      -- a footnote (or other insert): capture its typeset content
+      local content = n.head or n.list
+      local sub = extract_items(content, n)
+      local total = 0
+      for _, it in ipairs(sub) do
+        if it.k == 'box' then total = total + it.h + it.d
+        elseif it.k == 'glue' or it.k == 'kern' then total = total + (it.a or 0) end
+      end
+      items[#items + 1] = { k = 'ins', class = n.subtype or 0, items = sub, h = total }
+    elseif id == WHATSIT then
+      if not check_special(n) and LIT_SUB and n.subtype == LIT_SUB then
+        blk_gfx = true
+      end
     end
     n = n.next
   end
+  return items
+end
+
+-- Top level: the galley vbox -> vertical items with per-line runs.
+local function extract_galley()
+  local box = tex.box[TDOM_BOXNUM]
+  if not box then return {}, 0, 0, 0 end
+  colstack = {}
+  pending_fmarks = {}
+  local items = extract_items(box.list, box)
   return items, bp(box.width or 0), bp(box.height or 0), bp(box.depth or 0)
+end
+
+-- Called from the float environment shims: capture the float box galley.
+function tdom_float(n, placement, ftype)
+  local box = tex.box[TDOM_FLOATBOX]
+  if not box then return end
+  colstack = {}
+  local saved_gfx = blk_gfx
+  blk_gfx = false
+  local items = extract_items(box.list, box)
+  local fgfx = blk_gfx
+  blk_gfx = saved_gfx
+  blk_floats[#blk_floats + 1] = {
+    n = n,
+    placement = placement or 'tbp',
+    type = ftype or 'figure',
+    w = bp(box.width or 0),
+    h = bp(box.height or 0),
+    d = bp(box.depth or 0),
+    gfx = fgfx,
+    items = items,
+  }
+  if RENDER_MODE then
+    FLOAT_COPIES[#FLOAT_COPIES + 1] = node.copy_list(box)
+  end
 end
 
 -- ---------------------------------------------------------- reporting
@@ -389,7 +487,7 @@ end
 local function encode_runs(items)
   -- Runs are split at every kern/glue during the walk, so within a run the
   -- browser reproduces TeX's positions from pure font advances; only the
-  -- run-start x needs to travel.
+  -- run-start x needs to travel. Recurses into footnote inserts.
   for _, it in ipairs(items) do
     if it.runs then
       for _, r in ipairs(it.runs) do
@@ -403,12 +501,14 @@ local function encode_runs(items)
         end
       end
     end
+    if it.items then encode_runs(it.items) end
   end
 end
 
 function tdom_report()
   local items, w, h, d = extract_galley()
   encode_runs(items)
+  for _, f in ipairs(blk_floats) do encode_runs(f.items) end
   local fonts = {}
   for fid, f in pairs(seen_fonts) do
     if not f.sent then
@@ -423,6 +523,7 @@ function tdom_report()
     h = h,
     d = d,
     items = items,
+    floats = blk_floats,
     fonts = fonts,
     labels = blk_labels,
     refs = blk_refs,
@@ -442,6 +543,28 @@ function tdom_ship()
   local box = tex.box[TDOM_BOXNUM]
   if not box then return end
   local b = node.copy_list(box)
+  local w = math.max(b.width or 0, 65536)
+  local total = math.max((b.height or 0) + (b.depth or 0), 65536)
+  tex.box[255] = b
+  tex.pagewidth = w
+  tex.pageheight = total
+end
+
+-- Render children: after the main galley page, ship one tight page per
+-- captured float box (queued tokens run before the final \end).
+function tdom_ship_floats()
+  local lines = {}
+  for i = 1, #FLOAT_COPIES do
+    lines[#lines + 1] = '\\directlua{tdom_load_float(' .. i .. ')}'
+    lines[#lines + 1] = '\\shipout\\box255'
+  end
+  if #lines > 0 then tex.print(lines) end
+end
+
+function tdom_load_float(i)
+  local b = FLOAT_COPIES[i]
+  if not b then return end
+  FLOAT_COPIES[i] = false
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
@@ -476,6 +599,9 @@ function tdom_wait()
         blk_refs = {}
         blk_counters = {}
         blk_gfx = false
+        blk_floats = {}
+        pending_fmarks = {}
+        RENDER_MODE = false
         reconnect('job', newckpt)
         inject_job(body, false)
         return -- resume TeX: typeset, report, then \TDOMloop brings us back
@@ -490,6 +616,10 @@ function tdom_wait()
       local pid = fk.fork()
       if pid == 0 then
         JOB = { id = id, ckpt = -1, body = body }
+        blk_floats = {}
+        pending_fmarks = {}
+        RENDER_MODE = true
+        FLOAT_COPIES = {}
         reconnect('render', 0)
         lfs.chdir(jobdir)
         -- under LaTeX, raw callback.register is owned by luatexbase
@@ -523,6 +653,7 @@ function inject_job(body, ship)
   if ship then
     lines[#lines + 1] = '\\directlua{tdom_ship()}'
     lines[#lines + 1] = '\\shipout\\box255'
+    lines[#lines + 1] = '\\directlua{tdom_ship_floats()}'
     lines[#lines + 1] = '\\csname @@end\\endcsname'
   else
     for _, name in ipairs(COUNTERS) do

@@ -27,8 +27,9 @@ import { performance } from 'node:perf_hooks';
 import { SourceStore } from '../source-store.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
-import { paginate, reconcilePages } from '../page.js';
+import { buildPages, reconcile } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
+import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -42,8 +43,9 @@ const JOB_TIMEOUT = 30_000;
 const BOOT_TIMEOUT = 120_000;
 
 export class CheckpointEngine {
-  constructor({ workDir }) {
+  constructor({ workDir, docDir }) {
     this.workDir = path.resolve(workDir);
+    this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     mkdirSync(this.workDir, { recursive: true });
     this.store = new SourceStore();
     this.file = 'main.tex';
@@ -65,12 +67,17 @@ export class CheckpointEngine {
     this.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
     this.fontFiles = new Map(); // familyKey -> absolute path
     this.pages = [];
-    this.chunks = new Map(); // blockId -> {svg, wBp, hBp} exact renders (gfx)
+    this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
     this.bgAbort = false;
     this.bgTask = Promise.resolve();
     this.onAsyncPatches = null; // callback(report-ish) for gfx swaps
+    this.onExternalChange = null; // callback when an \input file changes
     this.backendName = 'checkpoint';
     this.diagnostics = [];
+    this.tocHash = null;
+    this.includes = new Map(); // path -> {mtime, text}
+    this.watchers = new Map(); // path -> FSWatcher
+    this.maxCheckpoints = 64;
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -94,6 +101,10 @@ export class CheckpointEngine {
 
   async close() {
     this.bgAbort = true;
+    for (const w of this.watchers.values()) {
+      try { w.close(); } catch { /* already closed */ }
+    }
+    this.watchers.clear();
     for (const peer of this.peers) peer.send('DIE\n');
     if (this.root) {
       try { this.root.kill('SIGKILL'); } catch { /* gone */ }
@@ -132,9 +143,11 @@ export class CheckpointEngine {
   getDOM() {
     const blockPages = new Map();
     for (const page of this.pages) {
-      for (const { u } of page.units) {
-        if (!blockPages.has(u.blockId)) blockPages.set(u.blockId, []);
-        const arr = blockPages.get(u.blockId);
+      for (const d of page.draw ?? []) {
+        const bid = d.u?.blockId;
+        if (!bid) continue;
+        if (!blockPages.has(bid)) blockPages.set(bid, []);
+        const arr = blockPages.get(bid);
         if (arr[arr.length - 1] !== page.number) arr.push(page.number);
       }
     }
@@ -311,7 +324,6 @@ export class CheckpointEngine {
         .map((c) => `'${c}'`)
         .join(',')}})}`
     );
-    L.push('\\directlua{tdom_geo()}');
     // label / ref recording shims (typesetting behavior unchanged)
     L.push('\\let\\TDOMlabel\\label');
     L.push("\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}");
@@ -325,12 +337,45 @@ export class CheckpointEngine {
     L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMpageref{#1}}");
     L.push('\\ifdefined\\eqref\\let\\TDOMeqref\\eqref');
     L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMeqref{#1}}\\fi");
-    // floats render inline in live mode (exports use the real full compile)
-    L.push('\\renewenvironment{figure}[1][]{\\par\\addvspace{\\intextsep}\\def\\@captype{figure}\\noindent\\begin{minipage}{\\textwidth}\\centering}{\\end{minipage}\\par\\addvspace{\\intextsep}}');
-    L.push('\\renewenvironment{table}[1][]{\\par\\addvspace{\\intextsep}\\def\\@captype{table}\\noindent\\begin{minipage}{\\textwidth}\\centering}{\\end{minipage}\\par\\addvspace{\\intextsep}}');
+    // \cite: record dependencies on bibliography keys
+    L.push('\\let\\TDOMcite\\cite');
+    L.push("\\renewcommand\\cite[2][]{\\directlua{tdom_cites('\\luaescapestring{#2}')}" +
+      '\\ifx\\relax#1\\relax\\TDOMcite{#2}\\else\\TDOMcite[#1]{#2}\\fi}');
+    // float capture: environments typeset into a box that the daemon walks;
+    // an anchor \special marks the declaration point for the page builder
+    L.push('\\newbox\\TDOMfloatbox');
+    L.push('\\directlua{TDOM_FLOATBOX=\\number\\TDOMfloatbox}');
+    L.push('\\newcount\\TDOMfloatn');
+    for (const env of ['figure', 'table']) {
+      L.push(
+        `\\renewenvironment{${env}}[1][tbp]{\\gdef\\TDOMfp{#1}\\def\\@captype{${env}}` +
+          '\\global\\setbox\\TDOMfloatbox\\vbox\\bgroup\\hsize\\textwidth\\centering}' +
+          `{\\egroup\\global\\advance\\TDOMfloatn\\@ne\\special{tdomfloat:\\number\\TDOMfloatn}` +
+          `\\directlua{tdom_float(\\number\\TDOMfloatn,'\\TDOMfp','${env}')}\\ignorespaces}`
+      );
+    }
+    // \tableofcontents reads the toc the orchestrator maintains; never write
+    L.push('\\renewcommand\\@starttoc[1]{{\\makeatletter\\@input{\\jobname.#1}}}');
+    // live bibliography: define \b@<key> as \bibitem runs so \cite resolves
+    L.push('\\ifdefined\\@bibitem\\let\\TDOMbibitem\\@bibitem');
+    L.push("\\def\\@bibitem#1{\\TDOMbibitem{#1}\\directlua{tdom_bib('\\luaescapestring{#1}','\\luaescapestring{\\the\\value{enumiv}}')}}\\fi");
+    L.push('\\ifdefined\\@lbibitem\\let\\TDOMlbibitem\\@lbibitem');
+    L.push("\\def\\@lbibitem[#1]#2{\\TDOMlbibitem[#1]{#2}\\directlua{tdom_bib('\\luaescapestring{#2}','\\luaescapestring{#1}')}}\\fi");
+    // page-builder geometry (skips are read as their natural widths)
+    L.push('\\directlua{tdom_dim(\'footinsskip\',\\number\\dimexpr\\skip\\footins\\relax)}');
+    L.push('\\directlua{tdom_dim(\'floatsep\',\\number\\dimexpr\\floatsep\\relax)}');
+    L.push('\\directlua{tdom_dim(\'textfloatsep\',\\number\\dimexpr\\textfloatsep\\relax)}');
+    L.push('\\directlua{tdom_dim(\'intextsep\',\\number\\dimexpr\\intextsep\\relax)}');
+    L.push('\\directlua{tdom_num(\'topfraction\',\\topfraction)}');
+    L.push('\\directlua{tdom_num(\'bottomfraction\',\\bottomfraction)}');
+    L.push('\\directlua{tdom_geo()}');
     // pre-known labels so forward references resolve in one pass after reboots
     for (const [key, val] of this.labelTable) {
-      L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+      if (key.startsWith('cite:')) {
+        L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
+      } else {
+        L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+      }
     }
     // font warmup: load the common face set into checkpoint 0
     L.push('\\setbox0=\\vbox{\\hsize=\\textwidth The quick brown fox 0123456789');
@@ -359,20 +404,70 @@ export class CheckpointEngine {
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
     const noindent = this.#noindentFor(idx);
-    const body = Buffer.from(block.text, 'utf8');
+    // Labels are defined in descendant lineages only; when resuming from an
+    // ancestor snapshot, forward-referenced values must be injected so this
+    // block sees the document-wide truth.
+    const defs = [];
+    for (const key of block.galley?.refs ?? []) {
+      const val = this.labelTable.get(key);
+      const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
+      if (val === undefined) {
+        // vanished label: neutralize stale definitions in this lineage
+        defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+      } else if (key.startsWith('cite:')) {
+        defs.push(`\\global\\@namedef{${cs}}{${val}}`);
+      } else {
+        defs.push(`\\global\\@namedef{${cs}}{{${val}}{1}}`);
+      }
+    }
+    const prelude = defs.length
+      ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
+      : '';
+    const body = Buffer.from(prelude + block.text, 'utf8');
     const galleyP = this.#await('galley:' + block.id);
     const ckptP = this.#await('ckpt:' + (idx + 1));
     ck.send(`JOB ${block.id} ${idx + 1} ${noindent ? 1 : 0}:${body.length}\n`);
     ck.sendRaw(body);
     const [galley] = await Promise.all([galleyP, ckptP]);
+    this.#retireOffGrid(idx);
     return galley;
+  }
+
+  // Sparse checkpoints: for large documents only every grid-th boundary
+  // stays resident. Edits resume from the nearest kept snapshot and simply
+  // retypeset a few extra clean blocks (~3ms each).
+  #ckptGrid() {
+    return Math.max(1, Math.ceil((this.blocks.length + 1) / this.maxCheckpoints));
+  }
+
+  #retireOffGrid(idx) {
+    const grid = this.#ckptGrid();
+    if (grid <= 1 || idx === 0 || idx % grid === 0) return;
+    if (!this.checkpoints.has(idx + 1)) return; // successor must exist first
+    const peer = this.checkpoints.get(idx);
+    if (peer) {
+      peer.send('DIE\n');
+      this.checkpoints.delete(idx);
+    }
+  }
+
+  #nearestCheckpoint(idx) {
+    let best = 0;
+    for (const k of this.checkpoints.keys()) {
+      if (k <= idx && k > best) best = k;
+    }
+    return best;
   }
 
   #adoptGalley(block, galley) {
     block.galley = galley;
-    block.galleyHash = fnv1a(JSON.stringify([galley.items, galley.w, galley.h, galley.d]));
+    block.galleyHash = fnv1a(
+      JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d])
+    );
     block.stateVec = JSON.stringify(this.counters.map((c) => galley.state?.[c] ?? 0));
     block.gfx = !!galley.gfx;
+    block.needsRender = block.gfx || (galley.floats ?? []).some((f) => f.gfx);
+    block.consumesToc = /\\tableofcontents\b/.test(block.text);
     block.kind = HEADING_RE.test(block.text)
       ? 'heading'
       : block.gfx
@@ -440,7 +535,8 @@ export class CheckpointEngine {
     t.lap('boot');
 
     const oldBlocks = this.blocks;
-    const segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
+    let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
+    segs = this.#expandIncludes(segs, 0);
     const diff = diffBlocks(this.blocks, segs, () => this.idSeq++);
     this.blocks = diff.blocks;
     const dirtySource = new Set(diff.dirty);
@@ -476,7 +572,7 @@ export class CheckpointEngine {
       }
     }
 
-    // ---- foreground typeset: from firstDirty until convergence ---------
+    // ---- foreground typeset: resume from the nearest kept snapshot -----
     const dirtyBlocks = [];
     const depDirty = [];
     const changedLabels = new Set();
@@ -484,7 +580,7 @@ export class CheckpointEngine {
     let forkMs = 0;
     const oldLabels = new Map(this.labelTable);
 
-    let i = firstDirty;
+    let i = this.#nearestCheckpoint(Math.min(firstDirty, this.blocks.length));
     while (i < this.blocks.length) {
       const block = this.blocks[i];
       const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
@@ -509,7 +605,7 @@ export class CheckpointEngine {
         }
       }
       i++;
-      if (wasClean && !changed) {
+      if (wasClean && !changed && i > firstDirty) {
         // convergence: verify no known-affected blocks remain downstream
         const affectedAhead = this.blocks.slice(i).some(
           (b) => !b.galley || (b.galley.refs ?? []).some((k) => changedLabels.has(k))
@@ -518,7 +614,6 @@ export class CheckpointEngine {
       }
     }
     const fgStop = i;
-    t.lap('typeset');
 
     // labels that vanished entirely
     for (const key of oldLabels.keys()) {
@@ -531,18 +626,77 @@ export class CheckpointEngine {
         changedLabels.add(key);
       }
     }
+
+    // Backward references: a label defined LATER in the chain (new figure,
+    // renamed equation...) can be referenced by EARLIER blocks, which the
+    // forward pass never revisits. Retypeset those ref-users explicitly.
+    if (changedLabels.size) {
+      for (let c = 0; c < this.blocks.length; c++) {
+        const block = this.blocks[c];
+        const hit = (block.galley?.refs ?? []).some(
+          (k) => changedLabels.has(k) && !resolvedInGalley(block, k, this.labelTable)
+        );
+        if (!hit) continue;
+        const from = this.#nearestCheckpoint(c);
+        for (let j = from; j <= c && j < this.blocks.length; j++) {
+          const g = await this.#jobBlock(j).catch(() => null);
+          if (!g) break;
+          const beforeHash = this.blocks[j].galleyHash;
+          this.#adoptGalley(this.blocks[j], g);
+          typesetCount++;
+          if (j === c && this.blocks[j].galleyHash !== beforeHash) {
+            dirtyBlocks.push(block.id);
+            for (const k of block.galley.refs ?? []) {
+              if (changedLabels.has(k)) push2(depDirty, 'label', k, block.id);
+            }
+          }
+        }
+      }
+    }
+    t.lap('typeset');
+
     for (const key of changedLabels) {
       for (const b of this.blocks) {
         if ((b.galley?.refs ?? []).includes(key)) push2(depDirty, 'label', key, b.id);
       }
     }
 
+    // ---- live table of contents -----------------------------------------
+    // Provisional pagination gives page numbers; if the toc data moved,
+    // retypeset the \tableofcontents blocks with the fresh toc file.
+    // Fixed point: the toc block's own height shifts page numbers, which
+    // shift the toc — iterate like latex reruns would, but per block.
+    for (let pass = 0; pass < 3; pass++) {
+      const prov = this.#paginateNow();
+      const toc = this.#computeToc(prov);
+      if (toc.hash === this.tocHash) break;
+      this.tocHash = toc.hash;
+      writeFileSync(path.join(this.workDir, 'driver.toc'), toc.content);
+      let anyConsumer = false;
+      for (let c = 0; c < this.blocks.length; c++) {
+        const block = this.blocks[c];
+        if (!block.consumesToc) continue;
+        anyConsumer = true;
+        const from = this.#nearestCheckpoint(c);
+        for (let j = from; j <= c && j < this.blocks.length; j++) {
+          const g = await this.#jobBlock(j).catch(() => null);
+          if (!g) break;
+          const beforeHash = this.blocks[j].galleyHash;
+          this.#adoptGalley(this.blocks[j], g);
+          typesetCount++;
+          if (j === c && this.blocks[j].galleyHash !== beforeHash) {
+            dirtyBlocks.push(block.id);
+            push2(depDirty, 'toc', 'contents', block.id);
+          }
+        }
+      }
+      if (!anyConsumer) break;
+    }
+    t.lap('toc');
+
     // ---- pages, display lists, patches ---------------------------------
-    this.#rebuildUnits();
-    const stream = [];
-    for (const block of this.blocks) stream.push(...(block.units ?? []));
-    const rawPages = paginate(stream, this.geometry.textheight);
-    const { pages, reused, rebuilt } = reconcilePages(rawPages, this.pages);
+    const pagesRaw = this.#paginateNow();
+    const { pages, reused, rebuilt } = reconcile(pagesRaw, this.pages);
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
     const prevCount = this.pages.length;
     const patches = [];
@@ -614,7 +768,10 @@ export class CheckpointEngine {
       }
     })();
     for (const block of this.blocks) {
-      if (block.gfx && (dirtyBlocks.includes(block.id) || !this.chunks.has(block.id))) {
+      const missingChunk =
+        (block.gfx && !this.chunks.has(block.id)) ||
+        (block.galley?.floats ?? []).some((f) => f.gfx && !this.chunks.has(block.id + '#' + f.n));
+      if (block.needsRender && (dirtyBlocks.includes(block.id) || missingChunk)) {
         this.bgTask
           .then(() => this.#renderBlock(block))
           .catch((err) => {
@@ -639,27 +796,35 @@ export class CheckpointEngine {
     await done;
     const pdf = path.join(jobdir, 'driver.pdf');
     if (!existsSync(pdf)) throw new Error('render child produced no PDF');
-    const svgPath = path.join(jobdir, 'chunk.svg');
-    await execFileP('pdftocairo', ['-svg', '-f', '1', '-l', '1', pdf, svgPath], { timeout: 30_000 });
-    const svg = readFileSync(svgPath, 'utf8');
-    const prev = this.chunks.get(block.id);
-    this.chunks.set(block.id, {
-      svg,
-      wBp: block.galley.w,
-      hBp: block.galley.h + block.galley.d,
-      v: (prev?.v ?? 0) + 1,
+    // page 1 = the block galley; pages 2..N = its float boxes in order
+    const targets = [];
+    if (block.gfx) {
+      targets.push({ key: block.id, page: 1, w: block.galley.w, h: block.galley.h + block.galley.d });
+    }
+    (block.galley.floats ?? []).forEach((f, i) => {
+      if (f.gfx) {
+        targets.push({ key: block.id + '#' + f.n, page: 2 + i, w: f.w, h: (f.h ?? 0) + (f.d ?? 0) });
+      }
     });
+    for (const tgt of targets) {
+      const svgPath = path.join(jobdir, `chunk-${tgt.page}.svg`);
+      await execFileP(
+        'pdftocairo',
+        ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
+        { timeout: 30_000 }
+      );
+      const svg = readFileSync(svgPath, 'utf8');
+      const prev = this.chunks.get(tgt.key);
+      this.chunks.set(tgt.key, { svg, wBp: tgt.w, hBp: tgt.h, v: (prev?.v ?? 0) + 1 });
+    }
     this.#asyncRepaginate();
   }
 
   #asyncRepaginate() {
     // rebuild display lists after async galley/chunk arrivals and push
     // patches through the async channel (SSE)
-    this.#rebuildUnits();
-    const stream = [];
-    for (const block of this.blocks) stream.push(...(block.units ?? []));
-    const rawPages = paginate(stream, this.geometry.textheight);
-    const { pages } = reconcilePages(rawPages, this.pages);
+    const rawPages = this.#paginateNow();
+    const { pages } = reconcile(rawPages, this.pages);
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
     const patches = [];
     for (const page of pages) {
@@ -680,20 +845,110 @@ export class CheckpointEngine {
 
   // --------------------------------------------------------------- units
 
+  #paginateNow() {
+    this.#rebuildUnits();
+    const stream = [];
+    for (const block of this.blocks) stream.push(...(block.units ?? []));
+    return buildPages(stream, this.geometry);
+  }
+
   #rebuildUnits() {
     const geo = this.geometry;
     let prevLastBox = null;
     for (const block of this.blocks) {
       const hasChunk = this.chunks.has(block.id);
-      const chunkState = block.gfx ? (hasChunk ? 'c' : 'r') : 'n';
-      const sig = `${block.galleyHash}|${prevLastBox ? prevLastBox.d : 'x'}|${chunkState}`;
+      const floatVs = (block.galley?.floats ?? [])
+        .map((f) => this.chunks.get(block.id + '#' + f.n)?.v ?? 0)
+        .join(',');
+      const sig = `${block.galleyHash}|${prevLastBox ? prevLastBox.d : 'x'}|${
+        hasChunk ? this.chunks.get(block.id).v : 0
+      }|${floatVs}`;
       if (!block.units || block.unitsSig !== sig) {
-        block.units = buildUnits(block, geo, prevLastBox, hasChunk);
+        block.units = buildUnits(block, geo, prevLastBox, hasChunk, this.chunks);
         block.unitsSig = sig;
       }
       const boxes = (block.galley?.items ?? []).filter((it) => it.k === 'box');
       if (boxes.length) prevLastBox = boxes[boxes.length - 1];
     }
+  }
+
+  // ----------------------------------------------------- toc / includes
+
+  #computeToc(pages) {
+    const blockPage = new Map();
+    for (const page of pages) {
+      for (const d of page.draw ?? []) {
+        const bid = d.u?.blockId;
+        if (bid && !blockPage.has(bid)) blockPage.set(bid, page.number);
+      }
+    }
+    const secIdx = this.counters.indexOf('section');
+    const subIdx = this.counters.indexOf('subsection');
+    const subsubIdx = this.counters.indexOf('subsubsection');
+    const lines = [];
+    for (const block of this.blocks) {
+      const m = block.text.match(/^\s*\\(section|subsection|subsubsection)(\*?)\s*\{/);
+      if (!m || m[2] === '*' || !block.stateVec) continue;
+      const vec = JSON.parse(block.stateVec);
+      const title = extractBraced(block.text, block.text.indexOf('{', m.index));
+      const page = blockPage.get(block.id) ?? 1;
+      let num;
+      if (m[1] === 'section') num = `${vec[secIdx]}`;
+      else if (m[1] === 'subsection') num = `${vec[secIdx]}.${vec[subIdx]}`;
+      else num = `${vec[secIdx]}.${vec[subIdx]}.${vec[subsubIdx]}`;
+      // 4th (destination) argument required by LaTeX 2020-10 and later
+      lines.push(`\\contentsline {${m[1]}}{\\numberline {${num}}${title}}{${page}}{}%`);
+    }
+    const content = lines.join('\n') + '\n';
+    return { hash: fnv1a(content), content };
+  }
+
+  #expandIncludes(segs, depth) {
+    if (depth > 3) return segs;
+    const out = [];
+    for (const seg of segs) {
+      const m = seg.text.match(/^\s*\\(input|include)\s*\{([^}]+)\}\s*$/);
+      if (!m) {
+        out.push(seg);
+        continue;
+      }
+      let rel = m[2];
+      if (!/\.tex$/i.test(rel)) rel += '.tex';
+      const full = path.resolve(this.docDir ?? this.workDir, rel);
+      let text = null;
+      try {
+        const st = statSync(full);
+        const cached = this.includes.get(full);
+        text = cached && cached.mtime === st.mtimeMs ? cached.text : readFileSync(full, 'utf8');
+        this.includes.set(full, { mtime: st.mtimeMs, text });
+        this.#watchInclude(full);
+      } catch {
+        this.diagnostics.push(`\\input file not found: ${rel} (typeset literally)`);
+        out.push(seg);
+        continue;
+      }
+      const subs = this.#expandIncludes(segmentBody(text, 0), depth + 1);
+      for (const s of subs) out.push({ ...s, file: full, hash: fnv1a(full + '|' + s.text) });
+    }
+    return out;
+  }
+
+  #watchInclude(full) {
+    if (this.watchers.has(full)) return;
+    try {
+      let timer = null;
+      const w = watch(full, () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => this.onExternalChange?.(full), 120);
+      });
+      this.watchers.set(full, w);
+    } catch {
+      /* watching is best-effort */
+    }
+  }
+
+  async refresh() {
+    return this.#update({ editLabel: 'external-include' });
   }
 
   #displayList(page) {
@@ -720,8 +975,21 @@ export class CheckpointEngine {
       gfxOpen = null;
     };
 
-    for (const { u, y } of page.units) {
-      const baseline = T + y;
+    for (const entry of page.draw ?? []) {
+      if (entry.rule) {
+        flushGfx();
+        commands.push({
+          op: 'rule',
+          x: r2(L),
+          y: r2(T + entry.y),
+          w: r2(entry.rule.w),
+          h: r2(entry.rule.h),
+          src: '_footrule',
+        });
+        continue;
+      }
+      const u = entry.u;
+      const baseline = T + entry.y;
       if (u.ln.gfxChunk) {
         const c = u.ln.gfxChunk;
         const unitTop = baseline - u.ln.boxH;
@@ -877,15 +1145,38 @@ class Peer {
 
 // ------------------------------------------------------------- helpers
 
-/** galley items -> pagination units (same contract as the other engines). */
-function buildUnits(block, geo, prevLastBox, hasChunk) {
+/**
+ * galley items -> pagination units. Footnote inserts attach to their line's
+ * unit; float anchors become float objects carrying their own mini-galleys.
+ */
+function buildUnits(block, geo, prevLastBox, hasChunk, chunks) {
   const items = block.galley?.items ?? [];
+  const floats = block.galley?.floats ?? [];
   const units = [];
   let pending = 0;
   let li = 0;
   let first = true;
   let lastUnit = null;
   let yOff = 0;
+  const pendingIns = [];
+
+  const makeFloat = (n) => {
+    const f = floats.find((x) => x.n === n);
+    if (!f) return null;
+    const chunkKey = block.id + '#' + f.n;
+    const chunkRef = f.gfx && chunks.has(chunkKey) ? { key: chunkKey, w: f.w } : null;
+    return {
+      id: chunkKey,
+      placement: f.placement,
+      type: f.type,
+      w: f.w,
+      h: (f.h ?? 0) + (f.d ?? 0),
+      gfx: f.gfx,
+      blockId: block.id,
+      units: miniUnits(f.items, block.id, chunkRef),
+    };
+  };
+
   for (const it of items) {
     if (it.k === 'glue' || it.k === 'kern') {
       pending += it.a ?? 0;
@@ -894,6 +1185,12 @@ function buildUnits(block, geo, prevLastBox, hasChunk) {
     }
     if (it.k === 'pen') {
       if ((it.v ?? 0) >= 10000 && lastUnit) lastUnit.keepWithNext = true;
+      continue;
+    }
+    if (it.k === 'ins') {
+      const ins = { units: miniUnits(it.items, block.id, null), h: it.h ?? 0 };
+      if (lastUnit) (lastUnit.inserts ??= []).push(ins);
+      else pendingIns.push(ins);
       continue;
     }
     let pre = pending;
@@ -916,6 +1213,8 @@ function buildUnits(block, geo, prevLastBox, hasChunk) {
       keepWithNext: false,
       ln: {
         descent: it.d ?? 0,
+        // height above the baseline only: pagination stores the baseline as
+        // top + boxH, and the display list recovers the top from it.
         boxH: it.h ?? 0,
         runs: it.runs ?? [],
         gfxChunk:
@@ -924,14 +1223,103 @@ function buildUnits(block, geo, prevLastBox, hasChunk) {
             : null,
       },
     };
+    if (pendingIns.length) unit.inserts = pendingIns.splice(0);
+    if (it.fm) {
+      for (const n of it.fm) {
+        const f = makeFloat(n);
+        if (f) (unit.floats ??= []).push(f);
+      }
+    }
     units.push(unit);
     lastUnit = unit;
     pending = 0;
     yOff += (it.h ?? 0) + (it.d ?? 0);
   }
-  if (lastUnit) lastUnit.post += pending;
+  if (lastUnit) {
+    lastUnit.post += pending;
+    if (pendingIns.length) (lastUnit.inserts ??= []).push(...pendingIns);
+  }
+  // float-only blocks: anchor floats to a zero-height carrier unit
+  if (!units.length && floats.length) {
+    units.push({
+      blockId: block.id,
+      li: 0,
+      h: 0.01,
+      pre: 0,
+      post: 0,
+      keepWithNext: false,
+      ln: { descent: 0, boxH: 0.01, runs: [], gfxChunk: null },
+      floats: floats.map((f) => makeFloat(f.n)).filter(Boolean),
+    });
+  }
   if (HEADING_RE.test(block.text) && lastUnit) lastUnit.keepWithNext = true;
   return units;
+}
+
+/** Convert a captured mini-galley (float body, footnote text) to draw units. */
+function miniUnits(items, blockId, chunkRef) {
+  const units = [];
+  let y = 0;
+  for (const it of items ?? []) {
+    if (it.k === 'glue' || it.k === 'kern') {
+      y += it.a ?? 0;
+      continue;
+    }
+    if (it.k !== 'box') continue;
+    units.push({
+      blockId,
+      h: (it.h ?? 0) + (it.d ?? 0),
+      yRel: y + (it.h ?? 0), // baseline relative to the mini-galley top
+      ln: {
+        descent: it.d ?? 0,
+        boxH: it.h ?? 0,
+        runs: it.runs ?? [],
+        gfxChunk: chunkRef ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w } : null,
+      },
+    });
+    y += (it.h ?? 0) + (it.d ?? 0);
+  }
+  return units;
+}
+
+/** Extract a balanced {...} group's contents starting at an opening brace. */
+function extractBraced(text, open) {
+  if (open < 0 || text[open] !== '{') return '';
+  let depth = 1;
+  let i = open + 1;
+  while (i < text.length && depth > 0) {
+    const c = text[i];
+    if (c === '{' && text[i - 1] !== '\\') depth++;
+    else if (c === '}' && text[i - 1] !== '\\') depth--;
+    if (depth === 0) break;
+    i++;
+  }
+  return text.slice(open + 1, i);
+}
+
+/**
+ * True when the block's galley plausibly already reflects the label's
+ * current value (cheap check: the rendered text contains the value and no
+ * unresolved ?? marker for it).
+ */
+function resolvedInGalley(block, key, labelTable) {
+  const val = labelTable.get(key);
+  if (val === undefined) return false;
+  if (block.__galleyText === undefined || block.__galleyTextHash !== block.galleyHash) {
+    const parts = [];
+    const visit = (items) => {
+      for (const it of items ?? []) {
+        for (const r of it.runs ?? []) if (r.t) parts.push(r.t);
+        if (it.items) visit(it.items);
+      }
+    };
+    visit(block.galley?.items);
+    for (const f of block.galley?.floats ?? []) visit(f.items);
+    block.__galleyText = parts.join(' ');
+    block.__galleyTextHash = block.galleyHash;
+  }
+  if (block.__galleyText.includes('??') || block.__galleyText.includes('[?]')) return false;
+  return block.__galleyText.includes(String(val));
 }
 
 function scanCounterDefs(preamble) {

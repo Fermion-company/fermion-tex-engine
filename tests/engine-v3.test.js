@@ -108,3 +108,57 @@ test('the engine survives malformed input mid-typing', opts, async () => {
   const r2 = await eng.edit(idx, idx + 6, '');
   assert.ok(r2.rev > r1.rev, 'recovered after fix');
 });
+
+test('footnotes are captured live and placed at the page bottom', opts, () => {
+  const withFeet = eng.pages.filter((p) => p.feet.length > 0);
+  assert.ok(withFeet.length >= 1, 'a page carries live footnotes');
+  const dl = withFeet[0].dl ?? null;
+  // the display list must contain the footnote rule
+  const dlNow = eng.getDisplayLists()[withFeet[0].number - 1];
+  assert.ok(dlNow.commands.some((c) => c.op === 'rule' && c.src === '_footrule'), 'footnote rule drawn');
+});
+
+test('figure floats are placed by the live output routine with real captions', opts, () => {
+  const dom = eng.getDOM();
+  assert.equal(dom.labels['fig:plot'], '1', 'real figure counter');
+  const floated = eng.pages.some((p) => p.topFloats.length + p.botFloats.length > 0);
+  assert.ok(floated, 'float placed in a top/bottom area');
+});
+
+test('the table of contents typesets live with page numbers', opts, () => {
+  const toc = eng.blocks.find((b) => /\\tableofcontents/.test(b.text));
+  assert.ok(toc?.galley, 'toc block typeset');
+  const boxes = (toc.galley.items ?? []).filter((i) => i.k === 'box');
+  assert.ok(boxes.length >= 5, `toc entries present (got ${boxes.length})`);
+});
+
+test('citations resolve from the live bibliography', opts, async () => {
+  assert.equal(eng.getDOM().labels['cite:knuth84'], '1');
+  assert.equal(eng.getDOM().labels['cite:lamport94'], '2');
+  const citeBlock = eng.blocks.find((b) => b.text.includes('cite{knuth84}'));
+  assert.ok(!JSON.stringify(citeBlock.galley.items).includes('[?]'), 'no unresolved citations');
+  // swap the two bibliography entries: citation numbers must follow
+  const src = eng.getSource();
+  const a = '\\bibitem{knuth84}';
+  const b = '\\bibitem{lamport94}';
+  const ia = src.indexOf(a);
+  assert.ok(ia > 0);
+  const r = await eng.edit(ia, ia + a.length, '\\bibitem{tempx}');
+  assert.ok(r.stats.labelsChanged.some((k) => k.startsWith('cite:')), 'cite keys tracked');
+  const src2 = eng.getSource();
+  const i2 = src2.indexOf('\\bibitem{tempx}');
+  await eng.edit(i2, i2 + '\\bibitem{tempx}'.length, a);
+});
+
+test('label renames propagate backwards to earlier referencing blocks', opts, async () => {
+  const src = eng.getSource();
+  const li = src.indexOf('\\label{fig:plot}');
+  await eng.edit(li, li + 17, '\\label{fig:plotX}');
+  const rb = eng.blocks.find((b) => b.text.includes('is a genuine float'));
+  assert.ok(JSON.stringify(rb.galley.items).includes('??'), 'earlier ref turned into ??');
+  const src2 = eng.getSource();
+  const l2 = src2.indexOf('\\label{fig:plotX}');
+  await eng.edit(l2, l2 + 18, '\\label{fig:plot}');
+  const rb2 = eng.blocks.find((b) => b.text.includes('is a genuine float'));
+  assert.ok(!JSON.stringify(rb2.galley.items).includes('??'), 'restored and resolved');
+});

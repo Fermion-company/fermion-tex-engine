@@ -42,7 +42,10 @@ async function createEngine() {
     };
   }
   return {
-    engine: new CheckpointEngine({ workDir: path.join(ROOT, '.tdom-v3') }),
+    engine: new CheckpointEngine({
+      workDir: path.join(ROOT, '.tdom-v3'),
+      docDir: path.join(ROOT, 'samples'),
+    }),
     backend: 'checkpoint',
     sample: readFileSync(path.join(ROOT, 'samples', 'demo-lua.tex'), 'utf8'),
   };
@@ -73,6 +76,13 @@ function broadcast(payload) {
 if (backend === 'checkpoint') {
   engine.onAsyncPatches = (partial) => {
     broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
+  };
+  engine.onExternalChange = () => {
+    withEngine(async () => {
+      lastReport = await engine.refresh();
+      broadcast({ kind: 'update', report: lastReport });
+      return lastReport;
+    }).catch(() => {});
   };
 }
 

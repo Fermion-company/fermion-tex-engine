@@ -11,12 +11,16 @@
 
 \begin{document}
 
+\tableofcontents
+
 \section{Live LuaLaTeX}
 \label{sec:live}
 
 This document is typeset by a \emph{real} Lua\LaTeX{} --- genuine
 Knuth--Plass line breaking, real Latin Modern fonts with ligatures and
-kerning, and the complete \term{amsmath} machinery. The \engine{} keeps
+kerning, and the complete \term{amsmath} machinery.\footnote{This footnote is typeset live: the engine captures
+TeX's insert nodes and the resident page builder reserves space for them
+at the bottom of the page, rule and all.} The \engine{} keeps
 the document resident: when you edit one sentence, only the block
 containing it is re-typeset by LuaTeX, and only the pages whose display
 list changed are patched in the preview.
@@ -60,10 +64,12 @@ comes from a real \term{amsthm} counter injected per block.
 \section{Graphics and Tables}
 \label{sec:graphics}
 
-A TikZ picture is just another block --- edit its coordinates and only
-this block recompiles:
+Figure~\ref{fig:plot} is a genuine float: declared here, placed by the
+live page builder according to its \texttt{[t]} specifier, with a real
+caption counter. Edit its coordinates and only this block recompiles:
 
-\begin{center}
+\begin{figure}[t]
+\centering
 \begin{tikzpicture}[scale=1.1]
   \draw[->, thick] (-0.2,0) -- (3.4,0) node[right] {$x$};
   \draw[->, thick] (0,-0.2) -- (0,2.2) node[above] {$y$};
@@ -71,7 +77,10 @@ this block recompiles:
   \draw[red, very thick, domain=0:2.1, smooth, dashed] plot (\x, {sqrt(\x)}) node[right] {$y = \sqrt{x}$};
   \fill[purple] (1,1) circle (2.2pt) node[above left] {$(1,1)$};
 \end{tikzpicture}
-\end{center}
+\caption{A live float: TikZ inside \texttt{figure}, placed at the top of
+the page by the resident output routine.}
+\label{fig:plot}
+\end{figure}
 
 Tables use \term{booktabs} rules, exactly as lualatex would print them:
 
@@ -106,5 +115,20 @@ inspector proves both claims on every keystroke.
 Structural changes --- a new package in the preamble, a class option
 --- take the honest path: the preamble format is rebuilt and every
 block recompiles once. Everything else stays live.
+
+\section{References in Motion}
+\label{sec:refs}
+
+Citations resolve from the live bibliography: \cite{knuth84} defined
+the machine, and \cite{lamport94} made it a document system. Renaming
+or reordering the entries below renumbers these citations exactly like
+a rerun of latex would.
+
+\begin{thebibliography}{9}
+\bibitem{knuth84} Donald E. Knuth. \emph{The \TeX book}.
+Addison--Wesley, 1984.
+\bibitem{lamport94} Leslie Lamport. \emph{\LaTeX: A Document
+Preparation System}. Addison--Wesley, 1994.
+\end{thebibliography}
 
 \end{document}

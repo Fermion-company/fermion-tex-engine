@@ -188,7 +188,13 @@ await eng.exportPDF();            // フルコンパイルPDF
 }
 ```
 
-## 既知の制限（lualatexバックエンド）
+## 既知の制限
+
+checkpointバックエンド: 段組（twocolumn）・marginpar・longtable未対応。
+フロートの`\clearpage`フラッシュ・脚注のページまたぎ分割は簡略。
+`\setcounter`絶対代入はカウンタ連鎖（デルタ方式）と非互換の場合あり。
+
+lualatexバックエンド（v1・参考実装）:
 
 - **float**（figure/table）は宣言位置にインライン描画（浮動配置しない）。
   PDF書き出しはフルコンパイルなので正しく浮動する。
