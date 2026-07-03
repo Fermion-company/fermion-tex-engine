@@ -1,18 +1,17 @@
-% Fermion TeX Engine — 実装総覧レポート
-% lualatex docs/implementation-report.tex で組版（このエンジン自身の検証対象と同じ環境）
+% Fermion TeX Engine — やさしい解説版レポート
+% lualatex docs/implementation-report.tex で組版
 \documentclass[11pt,a4paper]{ltjsarticle}
 \usepackage{luatexja}
 \usepackage[a4paper,margin=23mm]{geometry}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath}
 \usepackage{booktabs}
-\usepackage{array}
 \usepackage[hidelinks]{hyperref}
 
 \newcommand{\code}[1]{\texttt{#1}}
-\setlength{\parskip}{0.2\baselineskip}
+\setlength{\parskip}{0.35\baselineskip}
 
-\title{\textbf{Fermion TeX Engine 実装総覧}\\[0.3em]
-\large 常駐増分TeXランタイムと v3.2 完全一致システム}
+\title{\textbf{Fermion TeX Engine のしくみ}\\[0.3em]
+\large 「書いた瞬間、印刷そのままの見た目になる」編集環境 --- やさしい解説版}
 \author{TeX DOM Runtime プロジェクト}
 \date{2026年7月3日}
 
@@ -20,353 +19,237 @@
 \maketitle
 
 \begin{abstract}
-本書は Fermion TeX Engine（リポジトリ \code{fermion-tex-engine}）の実装全体を一冊にまとめた技術報告である。
-本エンジンは TeX を「毎回ファイルから PDF を作るバッチ処理系」から「文書状態を常駐保持し、
-ソース差分から表示差分を生成する組版ランタイム」へ作り替えたものであり、
-1打鍵あたり数ミリ秒の実組版で印刷同等のライブプレビューを実現する。
-v3.2 では「ライブプレビューが本物の lualatex 出力と原理的に一致する」ことを設計目標に据え、
-実測で全検証文書の全行が $0.02\,\mathrm{bp}$ 以内（約 $1/3600\,\mathrm{mm}$）で一致することを
-自動検証基盤により証明した。本書では 3 世代のバックエンド構成、fork チェックポイント機構、
-実メイン垂直リスト収穫、TeX ページビルダーの忠実移植、検証基盤、および開発中に発見した罠を記す。
+このソフトは、論文や技術文書づくりの定番である LaTeX（ラテフ）を、
+「書くたびに数秒待って PDF を作り直す道具」から
+「\textbf{文字を打った瞬間（約 0.03 秒）に、印刷とまったく同じ見た目が画面に出る}道具」に
+作り替えたものです。この文書では、専門知識がない方にも分かるように、
+どういう仕組みで速くしたのか、そして今回の改良で
+「画面のプレビュー」と「本物の PDF」のズレをどうやってゼロにしたのかを説明します。
+細かい技術資料は別冊（\code{docs/01}〜\code{07}）にあり、これはその入り口になる読み物です。
 \end{abstract}
 
 \tableofcontents
-\clearpage
 
 %======================================================================
-\section{目的と全体像}
+\section{このソフトは何をするもの？}
 
-出発点の要求は一言でいえば次のとおりである。
+\textbf{LaTeX（ラテフ）}は、数式や図表を含む文書をとても美しく仕上げてくれる
+「組版（くみはん）ソフト」です。組版とは、原稿の文字たちを
+「どの行のどの位置に、どのくらいの間隔で置くか」を決めて、紙面に並べる作業のこと。
+新聞や書籍のような仕上がりの美しさは、この組版の計算の賢さで決まります。
+LaTeX はこの計算が世界一級で、だから論文の世界では 40 年以上使われ続けています。
 
-\begin{quote}
-TeX を「毎回ファイルから PDF を作るバッチ処理系」ではなく、Web ブラウザのように文書状態を
-常駐保持し、ソース変更差分から表示差分を生成できる組版ランタイムへ作り替える。
-\end{quote}
+ただし LaTeX には昔からの弱点があります。\textbf{一文字直すだけでも、
+文書全体を最初から作り直す}ので、結果を見るまで数秒〜数十秒待たされるのです。
+本を一冊まるごと刷り直さないと誤植の直りが確認できない印刷所、を想像してください。
 
-成功条件は二段階で引き上げられてきた。第一段階は「この 1 文字変更で何が dirty になるか」に
-エンジンが正確に答え、変わったページだけをパッチすること。第二段階（v3.2）は
-「プレビューに表示されるものが、同じソースを素の \code{lualatex} でコンパイルした PDF と
-\textbf{原理的に一致する}」ことである。行分割・改ページ・フロート配置・脚注・グルーの一本まで、
-場当たりの視覚調整ではなく、同じ計算が同じ入力に対して走る構造で一致させる。
-
-\subsection{3世代のバックエンド}
-
-リポジトリには設計の進化がそのまま 3 つのバックエンドとして残っており、
-サーバー起動時に選択される（環境変数 \code{TDOM\_BACKEND}）。
+このプロジェクトで作った Fermion TeX Engine は、その待ち時間をなくしました。
 
 \begin{center}
-\begin{tabular}{llll}
+\begin{tabular}{lll}
 \toprule
- & v0: internal & v1: lualatex & \textbf{v3: checkpoint（既定）} \\
+ & 従来の LaTeX & \textbf{Fermion TeX Engine} \\
 \midrule
-組版の実体 & 自前JS（近似） & 本物のlualatex & 本物のlualatex \\
-実行形態 & 常駐JSオブジェクト & 編集ごとに新プロセス & \textbf{常駐プロセスツリー} \\
-1編集の速さ & $\sim$1ms & $\sim$430ms & \textbf{組版4--14ms} \\
-品質 & デモ水準 & 印刷同等 & \textbf{印刷同等（一致を実証）} \\
-脚注/フロート/目次 & なし & 近似 & \textbf{ライブで実配置} \\
+1 か所直したとき & 全体を作り直し（数秒〜） & \textbf{直した段落だけ組み直し（約 0.03 秒）} \\
+画面に出る見た目 & PDF を開き直して確認 & \textbf{打った瞬間に反映} \\
+仕上がりの品質 & 印刷品質 & \textbf{同じ（本物の LaTeX が計算）} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-v3 の核心は、\textbf{lualatex そのもの}に常駐してもらい、
-POSIX の \code{fork(2)}（コピーオンライト）で「各ブロック境界時点の完全な TeX 状態」を
-プロセスとして凍結保存することである。編集されたら古い続きに基づくチェックポイントを殺し、
-直前のスナップショットから変わったブロックだけを組み直す。
-プロセス起動もフォーマットロードもフォントロードも発生しない。
-
-\subsection{変更していないもの}
-
-「TeX を改造した」のではない。lualatex（LuaHBTeX）のバイナリ、Knuth--Plass 行分割、
-数式組版、ハイフネーション、フォント処理（luaotfload/HarfBuzz）、LaTeX カーネル、
-パッケージ群（amsmath, tikz, booktabs, luatexja, \ldots）はすべて無改変である。
-外から注入するのは (1) fork を Lua に公開する 71 行の C シム、
-(2) ソケット通信とノードリスト走査を行う Lua デーモン、
-(3) \code{\textbackslash label} 等を「元の動作を実行した上で記録する」約 40 行の TeX マクロシム、
-の 3 種だけである。\textbf{「lualatex が計算する内容」は一切変えず、
-「いつ・どの単位で計算するか」と「結果をどこへ出すか」だけを差し替えた}、
-というのが本プロジェクトの正確な要約である。
+大事なのは 3 行目です。速くするために「それらしい別物」を画面に出しているのではなく、
+\textbf{見た目を計算しているのは本物の LaTeX（lualatex）そのもの}です。
+行のどこで折り返すか、単語の間をどれだけ空けるか——そうした計算には一切手を加えていません。
+変えたのは「いつ・どの単位で計算するか」だけです。
 
 %======================================================================
-\section{checkpoint バックエンドの基礎}
+\section{なぜ速いのか --- 「セーブポイント」方式}
 
-\subsection{fork はTeX状態の完全なスナップショットである}
+秘密はゲームで言う\textbf{セーブポイント}です。
 
-TeX の内部状態（数万のマクロ、catcode 表、フォント、カウンタ、ボックスレジスタ）を
-アプリケーションレベルで保存・復元するのは絶望的だが、OS の視点ではただのプロセスメモリである。
-fork 自体は実測 $0.21\,\mathrm{ms}$、複製コストは書き換わったページ分だけ。
-文書を先頭からブロックごとに組版しながら各境界で fork して親を凍結すると、
-\code{ckpt}$_k$ =「ブロック $1..k$ を組版し終えた時点の TeX 完全状態」のプロセス鎖ができる。
+文書を段落ごとのブロックに区切り、
+「ブロック 1 まで処理し終えた状態」「ブロック 2 まで処理し終えた状態」…という具合に、
+\textbf{組版ソフトの作業状態を丸ごと保存}していきます。
+どこかを直したら、文書全体をやり直すのではなく、
+\textbf{直した場所の直前のセーブポイントに戻って、そこから直した段落だけ}を組み直します。
+ゲームで敵にやられたとき、最初からではなく直前のセーブから再開するのと同じ発想です。
 
-デーモンの凍結は 1 つの末尾再帰マクロで実現される：
-\begin{center}
-\code{\textbackslash def\textbackslash TDOMloop\{\textbackslash directlua\{tdom\_wait()\}\textbackslash TDOMloop\}}
-\end{center}
-親は \code{tdom\_wait()} 内のブロッキング read で永久停止し（CPU は食わない）、
-fork の子だけが Lua から return して TeX の入力へ戻る。
-その入力とは直前に \code{tex.print} で注入されたブロック組版コードであり、
-組版・報告を終えた子は再び \code{tdom\_wait()} に入って次のチェックポイントとして凍結する。
+「作業状態を丸ごと保存」と言うと重たそうですが、ここに OS（macOS や Linux）の
+便利な機能を使っています。\textbf{fork（フォーク）}という「動いているプログラムの
+完全なコピーを一瞬で作る」機能で、コピーにかかる時間は実測 0.0002 秒。
+LaTeX が読み込んだフォントや設定、章番号の進み具合など、何万項目もの内部状態が
+そっくりそのまま保存されます。
 
-\subsection{ガレー抽出 --- ノードリストから描画へ}
-
-組み上がったノードリストは Lua デーモンが歩き、「どのフォントのどの文字をどの座標に置くか」を
-JSON でオーケストレータ（Node.js）へ送る。最重要の設計判断は
-\textbf{run（グリフ連なり）を kern / glue の出現ごとに分割する}ことである。
-TeX は単語内カーニングを kern ノードとして実体化するので、run 内部にはもう位置調整が存在せず、
-「開始 $x$ だけ送れば、あとはフォントの字送り幅を足すだけで TeX と同じ座標になる」ことが保証される。
-ブラウザは TeX が使ったフォントファイルそのものを \code{@font-face} で受け取り、
-カーニング・リガチャ再適用を無効化して描く。これにより 1 グリフごとの座標を送らずに済む。
-
-\subsection{収束の自己検証}
-
-増分計算の正しさは通常「依存の完全列挙」に懸かるが、TeX では catcode もマクロも動的であり
-完全列挙は不可能である。本エンジンの停止判定はより強い性質を持つ：
-\textbf{「クリーンなはずのブロックを実際にもう 1 つ組版してみて、出力（galley ハッシュ）と
-状態ベクトル（追跡カウンタ等の出口値）が前回と完全一致したら止まる」}。
-停止判定そのものが検算になっており、LaTeX の「もう一回コンパイル」をブロック単位に局所化した形である。
+この仕組みのおかげで、1 打鍵あたりの仕事は
+「セーブポイントの複製＋段落 1 つ分の組版」だけになり、
+数ミリ秒（1 ミリ秒 = 1/1000 秒）で終わります。
 
 %======================================================================
-\section{v3.2 完全一致システム}
+\section{今回の大改良 --- プレビューと本物の PDF のズレをなくした}
 
-\subsection{診断 --- 揺らぎはどこから来ていたか}
+\subsection{何が問題だったか}
 
-v3.1 まではブロックを \code{\textbackslash vbox\{...\}} の中で組版していた。
-このグループ境界で TeX の状態が失われ、それを JS 側の近似式で「再構成」していたことが、
-実 PDF との「行数や位置の微妙な違い」の根本原因だった。具体的には：
+これまでの版でも見た目はほぼ正しかったのですが、
+本物の lualatex で作った PDF と見比べると、
+\textbf{ページ内の行数が時々 1 行違う}、\textbf{見出しの前の空きが微妙に違う}、
+\textbf{図が壊れたアイコンになる}、といったズレがありました。
 
-\begin{enumerate}
-\item \textbf{ブロック間グルーの推定}：
-  $\max(\code{lineskip},\ \code{baselineskip}-d_{\text{prev}}-h)+\code{parskip}$
-  という等価式で段落間の行送りを再構成していたが、実際の \code{\textbackslash prevdepth} 連鎖・
-  \code{\textbackslash addvspace}・\code{\textbackslash parskip} と微妙にずれ、ページ内で累積した。
-\item \textbf{\code{\textbackslash @afterheading} 状態の喪失}：
-  見出し直後の \code{\textbackslash everypar}（インデント抑制）や club penalty $10000$ が
-  vbox のグループ境界で消えた。目次（\code{\textbackslash section*} が
-  \code{@nobreak} を立てたまま終わる）の直後では、次の \code{\textbackslash section} の
-  \code{\textbackslash if@nobreak} 分岐が実際と逆に転び、見出し前の
-  \code{\textbackslash addvspace} 約 15bp が出たり出なかったりした。
-\item \textbf{ページビルダーが近似}：\code{\textbackslash topskip} 未実装
-  （毎ページ約 3pt 容量がずれ、境界ケースで行数が揺れる）、widow/club penalty の無視、
-  \code{\textbackslash footnoterule} を固定 6bp と近似（実際は正味 0pt）、
-  \code{ins.h+2} のようなマジックナンバー等。
-\end{enumerate}
+プレビューは「だいたい合っている」では困ります。画面で見たものがそのまま印刷される
+——それがこの道具の存在意義なので、「原理的にズレが生じない構造」に作り直しました。
 
-対策は「JS で垂直方向の寸法を発明しない。すべての値を TeX の実ノードまたは実測パラメータから取り、
-消費するアルゴリズムは TeX 自身のものを移植する」ことである。
+\subsection{ズレの正体 --- 「別の作業台」で組んでいた}
 
-\subsection{実メイン垂直リスト収穫（MVL harvest）}
+原因をたとえ話で説明します。
 
-v3.2 ではブロックを \textbf{本物のメイン垂直リスト（MVL）上で}組版する。
-TeX 内蔵のページビルダーは次の 3 点で「休眠」させる：
+これまでのエンジンは、各段落を\textbf{本の紙面とは別の、小さな作業台の上で}組んでいました。
+そして出来上がった段落を、あとから紙面に貼り付けていました。
+段落 1 つの中身はこれで完璧に組めます。ところが——
 
 \begin{itemize}
-\item \code{\textbackslash vsize=\textbackslash maxdimen} --- ページは決して満ちず、出力ルーチンは自然には発火しない。
-\item \code{\textbackslash holdinginserts=1} --- 脚注の ins ノードが行位置のままストリームに残る。
-\item \textbf{ダミーボックス} --- 起動時に \code{\textbackslash hbox to0pt\{\}} を一度だけ寄与させて
-  ページビルダー内部の \code{page\_contents} フラグを \code{box\_there} にし
-  （このフラグは Lua から到達できない）、以後は Lua で \code{tex.lists.page\_head} の
-  リストだけをダミーに差し替える。これにより「空ページ先頭でのグルー破棄」と
-  「\code{\textbackslash topskip} グルーの挿入」が永久に抑止される。どちらも実ページ境界で
-  オーケストレータ側が行う仕事である。
+\item 「前の段落との間をどれだけ空けるか」は、前の段落の最後の行の形に依存します。
+  小さな作業台の上では前の段落が見えないので、貼り付けるときに\textbf{計算式で推測}していました。
+\item 「見出しの直後の段落は行頭を下げない」「見出しの直後では改ページしない」といった
+  \textbf{前後のつながりの情報}も、作業台の外に持ち出せずに消えていました。
 \end{itemize}
 
-ブロックの組版後、\code{tdom\_report()} がページリストを収穫し、
-新しいダミーを播種してからチェックポイントとして凍結する。この方式の意味は決定的である：
-\code{\textbackslash prevdepth}・\code{\textbackslash everypar}・\code{\textbackslash spacefactor} などの
-ブロック間状態が \textbf{fork のプロセス連鎖として自然に継続}するため、
-収穫されるノード列は「素の lualatex が文書全体を一気に組んだときの MVL」と
-\textbf{バイト単位で一致}する。段落間グルー・\code{\textbackslash parskip}・
-\code{\textbackslash addvspace}・widow/club penalty（見出し直後の $10000+150=10150$ まで）が
-すべて TeX の実物になる。この同一性は、素のコンパイルとの対照実験
-（\code{\textbackslash directlua} 収穫呼び出しがノード列に痕跡を残さないことの確認）で検証した。
+推測は本物と数ミクロン〜数ミリずれます。ズレはページの下に行くほど積み重なり、
+「あと 1 ミリで次の行が入るかどうか」の境目では\textbf{行が丸ごと 1 本ずれる}ことになります。
+これが「行数が微妙に違う」の正体でした。
 
-強制排出（\code{\textbackslash newpage}・\code{\textbackslash clearpage}・生の \code{\textbackslash penalty-10000}）だけは
-出力ルーチンを発火させる。安全網 \code{tdom\_absorb\_output()} が \code{\textbackslash box255} の中身を
-寄与リスト経由でページに戻し、\code{tdom:eject:\textit{penalty}} マーカーを植えるので、
-オーケストレータのページビルダーがその位置で正確に改ページする
-（\code{\textbackslash clearpage} の $-10001$ なら \code{\textbackslash @doclearpage} と同様に
-空ページを破棄しフロートを放流する）。
+\subsection{直し方 その1 --- 本物の紙面の流れの上で組む}
 
-なお入力途中の未閉ブレースは \code{\textbackslash long} マクロ引数のランナウェイとなり、
-注入した報告コードごと EOF まで食い尽くして fork 子を殺す（旧 vbox 方式では閉じ括弧が構造的に
-止めていた）。オーケストレータが不均衡分の \code{\}} を自動補完してから注入し、
-均衡が戻れば厳密経路に自動復帰する。
+v3.2 では、段落を別の作業台ではなく、
+\textbf{本物の紙面の流れ（LaTeX が実際に文書を組んでいくときの本流）の上で}組み、
+出来上がった結果をそのまま写し取る方式に変えました。
+写し取ったら本流を巻き戻して、次の編集に備えます。
 
-\subsection{ページビルダー --- tex.web と ltoutput の忠実移植}
+こうすると、段落同士の間隔・字下げ・「ここで改ページするな」という印などが、
+推測ではなく\textbf{すべて LaTeX 自身が置いた本物}になります。
+実験で、この方式で写し取った中身が「普通に lualatex で一気に組んだ場合」と
+\textbf{1 バイトもたがわず一致する}ことを確認しました。
+つまり材料のレベルで、もうズレようがありません。
 
-\code{pagebuilder.js} は v3.2 で全面書き換えされ、TeX のページ分割アルゴリズム
-（\code{tex.web} \S1005--1008）と LaTeX の出力ルーチン（\code{ltoutput}）の transcription となった。
-このファイルの中に発明された寸法は存在しない。すべての値はストリーム（実ノード）か、
-ライブ TeX から伸縮成分込み（\code{\textbackslash gluestretch} 等）で実測したパラメータである。
+\subsection{直し方 その2 --- ページ割り付けの「規則書」を丸写しする}
 
-\paragraph{改ページ判定}
-TeX と同じ合法ブレークポイント（非破棄物直後の glue、glue が続く kern、$p<10000$ の penalty）、
-同じコスト関数 $c = b + p$（badness $b$ は \code{tex.web} \S108 の整数アルゴリズムをそのまま実装）、
-同じ「最良ブレークを記憶し、overfull で発火、コストのタイはあとが勝つ」規則。
-widow/club/\code{\textbackslash @secpenalty} はストリーム内の実 penalty として自然に効く。
-\code{\textbackslash topskip}（ページ先頭ボックス上の実グルー）、\code{\textbackslash maxdepth} の深さ繰入れ、
-footins のページゴール減算（\code{\textbackslash skip\textbackslash footins} の自然長と
-各 ins の高さ $\times$ \code{\textbackslash count\textbackslash footins}$/1000$）も
-\code{tex.web} のとおりである。
+材料が本物でも、それを\textbf{ページに割り付ける係}（どの行でページを切るか、
+図をページの上に置くか下に置くか、脚注の場所をどう確保するか）が我流では、
+やはり結果がずれます。
 
-\paragraph{フロート}
-\code{\textbackslash @addtocurcol} $\to$ \code{\textbackslash @addtotoporbot} $\to$
-\code{\textbackslash @addtobot}、ページ境界での \code{\textbackslash @startcolumn}
-（\code{\textbackslash @tryfcolumn} のフロートページ生成、\code{\textbackslash @addtonextcol}）、
-\code{\textbackslash @makefcolumn} 放流、型順序保存の衝突規則まで、
-\code{latex.ltx} の条件式を逐語的に移植した。カウンタ（topnumber 系）と分数
-（\code{\textbackslash topfraction} 系）、分離グルー（floatsep 系）、フロートページの
-\code{\textbackslash @fptop}/\code{\textbackslash @fpsep}/\code{\textbackslash @fpbot} は
-すべて実行時に実測送信される。\code{h} 配置は本文ストリームへの
-$[\text{pen}][\text{intextsep}][\text{box}][\text{pen}][\text{intextsep}]$ 注入で、
-垂直モード宣言のフロートには \code{\textbackslash vskip-\textbackslash parskip} も再現する。
+幸い、TeX と LaTeX には割り付けの\textbf{厳密な規則書}が存在します
+（TeX の原典プログラムと、LaTeX の出力ルーチンと呼ばれる部分です）。
+以前の割り付け係はこの規則書の「要約版」で動いていて、ところどころに
+決め打ちの数字（例：脚注の線のまわりは 6 ポイント空ける、など）が入っていました。
 
-\paragraph{ページ組立（\code{\textbackslash @makecol}）}
-本文 $+$ \code{\textbackslash vskip\textbackslash skip\textbackslash footins} $+$
-クラスの \code{\textbackslash footnoterule} を\textbf{実測したカーン／罫アイテム列として再生}
-（article なら kern $-3$pt・罫 $0.4$pt・kern $2.6$pt = 正味 0pt）$+$ ins 内容の連結、
-\code{\textbackslash @combinefloats} の上下フロート、末尾の \code{\textbackslash vskip-\textbackslash dp}
-（最終深さ打消し）と \code{\textbackslash @textbottom}（raggedbottom なら 0pt plus .0001fil）。
-最後に vbox-to-\code{\textbackslash @colht} 相当の\textbf{グルー分配}（次数別 stretch/shrink、fil 優先）で
-絶対座標を確定するため、raggedbottom / flushbottom / フロートページの fil 配分が
-TeX と同じ算術で出る。文書末尾は \code{\textbackslash enddocument} の \code{\textbackslash clearpage}
-（\code{\textbackslash vfil} + 排出 + フロート放流）を再現する。これにより最終ページの
-下部フロートがページ底に沈む挙動まで一致する。
-
-\subsection{収束機構の拡張 --- ブロック間レイアウト状態}
-
-MVL 方式では「次のブロックの先頭グルー」が前のブロックの出口状態
-（\code{\textbackslash prevdepth} と \code{\textbackslash if@nobreak}）に依存する。
-そこでこの 2 つを状態ベクトルに追加した（\code{tdom@pd}, \code{tdom@nobreak}）。
-既存の「もう 1 ブロック組んで一致するまで」の自己検証がそのまま拡張され、
-目次の固定点反復や後方参照パスがブロック連鎖を短絡してもレイアウト状態の食い違いが自動的に検出・
-再組版される。すべての再組版経路は共通の \code{\#retypesetChain}（収束するまで延長）を通る。
-
-\subsection{精密レンダー層（チャンク）の修正}
-
-グリフで描けないもの（TikZ 等の pdf\_literal、レガシー Computer Modern 数式）は
-「即時はグリフ近似 $\to$ 本物の PDF 由来 SVG に自動置換」の 2 層戦略をとる。
-v3.2 ではこの層の不具合を 4 件修正した：
-
-\begin{enumerate}
-\item \textbf{フロートチャンク URL の \code{\#}}：チャンク鍵 \code{b14\#1} がそのまま
-  URL に入り、フラグメント扱いで 404 になっていた（プレビューで図が壊れアイコンになる主因）。
-  \code{encodeURIComponent} で解決。
-\item \textbf{PDF フラッシュ前の変換競合}：\code{finish\_pdffile} コールバック（DONE 通知）は
-  ディスクフラッシュ前に発火するため、\code{pdftocairo} が不完全な PDF を読むことがあった
-  （チャンクがランダムに欠落）。\code{\%\%EOF} 確認まで待機して解決。
-\item \textbf{hyperref 系文書の分離レンダ}：常駐ツリーが PDF を出荷できないプリアンブルでは
-  単発 lualatex でチャンクを作るが、これが旧 vbox 方式のままでガレーとずれていた。
-  休眠ページ方式を単発実行でも再現し（\code{tdom:isostart} マーカー、前ブロックの実
-  \code{\textbackslash prevdepth}・\code{\textbackslash if@nobreak} を注入）、
-  ガレーと同じ先頭グルーを持つ画素整合チャンクを得る。
-\item \textbf{luatexja の shipout フック}：ltjs 系クラスではページ寸法指定が上書きされ、
-  チャンクが紙サイズで出ることがある。箱は \code{\textbackslash hoffset=-1in} により常に原点にあるため、
-  SVG の viewBox を既知の箱寸法へ正規化する \code{cropSvg} で常に正確に切り出す。
-\end{enumerate}
+今回、この要約版を捨てて、\textbf{規則書を一行ずつそのまま移植}しました。
+決め打ちの数字は全廃し、必要な寸法はすべて実際に動いている LaTeX から測って受け取ります。
+「規則書のどこを読んでも、うちの割り付け係は同じことをする」——これが
+「原理的に同じ見た目になる」ことの根拠です。
 
 %======================================================================
-\section{検証基盤 --- 「一致」を仕組みで証明する}
+\section{「本当に一致しているの？」の確かめ方}
 
-\subsection{基線比較器 verify-layout}
+主張だけでは信用できないので、\textbf{自動の答え合わせ機}を作りました。
 
-\code{tools/verify-layout.mjs} は同じソースに対して
-(a) エンジンをヘッドレスで走らせた表示リストと、
-(b) 素の lualatex 2 パスコンパイルの PDF を突き合わせる。
-真値の抽出は \textbf{PDF コンテンツストリームの直接パース}
-（\code{qpdf} で展開し、\code{1 0 0 1 x y Tm} 行列と TJ 配列を読む。\code{tools/pdf-lines.mjs}）による。
-当初 \code{pdftocairo -svg} の座標を使っていたが、
-\textbf{pdftocairo は座標に約 0.1\% の系統歪みを入れる}ことを手製 PDF で実証したため排除した
-（この歪みは許容誤差 0.1bp の 3 倍以上あり、偽の不一致を量産していた）。
+同じ原稿を（a）このエンジン、（b）本物の lualatex、の両方で処理し、
+\textbf{すべての行の位置}（何ページ目の、上から何ミリの位置か、行頭はどこか）を
+機械的に突き合わせます。人間の目視ではなく、数値での全数チェックです。
 
-比較はページ数・行数（ベースラインのクラスタ）・各行の $y$（0.02bp 量子化）・行頭 $x$ を対象とし、
-精密チャンクに覆われる領域は「チャンクの画素＝PDF の画素」なので被覆判定で処理する。
-
-\subsection{増分経路の検証 verify-edits}
-
-\code{tools/verify-edits.mjs} は open 直後ではなく、
-\textbf{編集を重ねた後の状態}が正確であることを検証する：
-語の書換えと取消し、数式環境の挿入（式番号の連鎖再採番）、ラベル改名と参照更新、段落置換の
-6 編集を増分機構で適用し、最終ソースを新規に 2 パスコンパイルした真値と比較する。
-
-\subsection{結果}
+結果は次のとおりです。
 
 \begin{center}
 \begin{tabular}{lrl}
 \toprule
-検証文書 & 一致行 & 備考 \\
+検証した文書 & 一致した行 & 内容 \\
 \midrule
-\code{samples/demo-lua.tex} & 85/85 & 脚注・[t]フロート・TikZ・目次・文献 \\
-\code{templates/minimal.tex} & 3/3 & \\
-\code{templates/article-en.tex} & 62/62 & [t]図・[b]表・脚注・文献 \\
-\code{templates/article-ja.tex} & 43/43 & luatexja 日本語 \\
-\code{templates/math-notes.tex} & 50/50 & 定理環境・整列数式 \\
-ユーザー実文書（ltjsarticle+hyperref） & 36/36 & maketitle・目次・\code{\textbackslash clearpage} \\
+英語デモ文書 & 85/85 & 脚注・図・表・数式・目次・参考文献入り \\
+最小文書 & 3/3 & \\
+英語論文テンプレート & 62/62 & 図表の自動配置・脚注入り \\
+日本語テンプレート & 43/43 & 日本語組版（luatexja） \\
+数学ノートテンプレート & 50/50 & 定理環境・複数行数式 \\
+日本語実文書 & 36/36 & 表紙・目次・改ページ・数式入り \\
 \midrule
-編集 6 連続後（増分経路） & 86/86 & \code{verify-edits} \\
+編集を 6 回重ねた後の状態 & 86/86 & 差分更新の経路でも一致 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-すべての行で $\Delta y \le 0.02\,\mathrm{bp}$（検証器の量子化粒度）。
-既存の統合テスト 30 本もすべて通過している。
-ブラウザ実機でも実 PDF のラスタと並べて目視比較し、TikZ 図・表・脚注罫・数式・ノンブルの
-位置と見た目の一致を確認した。
+\textbf{全文書・全行が一致}しました。残っている差は最大 0.02 bp。
+bp は印刷業界の長さの単位で、0.02 bp は\textbf{約 7 ミクロン ＝ 髪の毛の太さの 10 分の 1 以下}です
+（これは答え合わせ機の測定粒度そのもので、事実上「ぴったり」を意味します）。
+
+おまけの発見もありました。答え合わせに最初使っていた市販の変換ツール
+（PDF を画像に直すツール）が、\textbf{実は座標を約 0.1\%歪めて出力する}ことが判明したのです。
+偽物のズレに悩まされた末、PDF ファイルの中身を直接読む方式に切り替えて解決しました。
+「測定器そのものを疑う」ことも今回の大事な教訓でした。
 
 %======================================================================
-\section{今回追加された罠アーカイブ}
+\section{図やグラフがきれいに出なかった問題も解決}
 
-開発中に発見し、将来の変更者が再び踏まないよう記録しておくべき事実：
+図（TikZ という作図機能）や複雑な数式は、文字と違って
+「本物の PDF から絵として切り出して、プレビューに貼り込む」方式にしています。
+本物の PDF の絵そのものなので、\textbf{原理的に印刷と同じ見た目}になります。
+今回、この貼り込みまわりの不具合を 4 つ直しました。
 
 \begin{enumerate}
-\item \textbf{pdftocairo は座標を歪める}：\code{-svg} 出力はコンテンツ座標に約 0.1\% の
-  スケール誤差を含む（手製の最小 PDF で実証）。検証には PDF コンテンツストリームを直接読むこと。
-\item \textbf{\code{page\_contents} フラグは Lua から見えない}：
-  \code{tex.lists.page\_head} をいくら差し替えても、ページビルダーが「ページは空」と
-  思っていればグルー破棄と topskip 挿入が起こる。実ボックスを一度 TeX 経由で寄与させて
-  フラグを立ててからリスト手術を行うこと。
-\item \textbf{未閉ブレースはランナウェイで子を殺す}：\code{\textbackslash emph\{} のような入力途中の
-  ブロックは \code{\textbackslash long} 引数走査が注入コードごと EOF まで消費する。
-  注入前に括弧収支を数えて自動閉鎖する。
-\item \textbf{\code{finish\_pdffile} はディスクフラッシュ前に発火する}：
-  fork 子の stdio バッファは \code{\_exit} 時にしか書き切られない。
-  ファイル末尾の \code{\%\%EOF} を確認してから変換にかけること。
-\item \textbf{luatexja は shipout をフックする}：ページ寸法の直前指定が無効化されることがある。
-  出荷箱を原点に固定（\code{\textbackslash hoffset=-1in}）し、viewBox 切り出しで吸収する。
-\item \textbf{チャンク鍵の \code{\#} は URL で死ぬ}：フロートチャンク鍵（\code{blockId\#n}）を
-  URL に埋めるときは必ずエンコードする。
+\item \textbf{図が壊れたアイコンになる}：図の画像を呼び出す名前に「\#」という記号が
+  入っており、ブラウザは「\#」から先を別の意味に解釈するため、名前が途中で切れて
+  画像を見つけられていませんでした。名前の書き方を直して解決。
+\item \textbf{図がときどき欠ける}：書き込みが終わりきっていない PDF ファイルを
+  読んでしまう瞬間がありました。「最後まで書けたか」を確認してから読むようにして解決。
+\item \textbf{日本語文書で数式の位置がずれる}：日本語用の部品がページの寸法指定を
+  上書きしてしまい、切り出し位置が狂うことがありました。切り出し方を
+  寸法指定に頼らない方式に変えて解決。
+\item \textbf{特定の設定（hyperref）の文書で数式が重なって表示される}：
+  この場合だけ古い方式で絵を作っていたのが原因で、新方式に揃えて解決。
 \end{enumerate}
 
-%======================================================================
-\section{性能}
-
-v3.2 の完全一致化は増分性能を損なっていない。編集 1 回のフォアグラウンド経路は従来どおり
-「fork（$\sim$0.2ms）＋変更段落の Knuth--Plass（数 ms）＋ノード走査と JSON」であり、
-実測で組版 4--14ms、打鍵から画面反映まで約 30ms。ページビルダーの移植は純 JS 演算で
-1ms 未満、チェックポイントのスパース化（最大 64 常駐）や
-ページの参照同一性による表示リスト再利用もそのまま機能している。
-チャンク（TikZ 等）は従来どおり非同期で 1--2 秒後に精密画像へ置換される。
+現在は、図・表・数式ともに印刷そのものの見た目でプレビューされます。
 
 %======================================================================
-\section{既知の制限と今後}
+\section{できないことも正直に}
+
+未対応の機能もあります。ごまかしの近似はせず、「未対応」と分かる形にしてあります。
 
 \begin{itemize}
-\item 脚注のページまたぎ分割（\code{\textbackslash vsplit} 相当）は未実装。
-  該当ケースは検出して診断に出す。
-\item 二段組（twocolumn）・\code{\textbackslash marginpar}・\code{\textbackslash enlargethispage} は未対応。
-\item \code{figure}/\code{table} 以外のフロート環境（パッケージ独自の \code{\textbackslash newfloat} 系）は
-  シム対象外で、出力ルーチン発火時は安全網が吸収するのみ。
-\item Windows ネイティブは fork(2) 依存のため対象外（WSL は可）。
+\item 1 つの脚注が長すぎて次のページにまたがる場合の分割
+\item 二段組のレイアウト
+\item 欄外への書き込み（marginpar）
 \end{itemize}
 
-いずれも「未対応であることが分かる」形で残してあり、
-場当たりの近似でごまかす箇所は残していない。今後対応する場合も本書の方針
-——実ノードと実測パラメータのみを入力とし、TeX 自身のアルゴリズムを移植し、
-\code{verify-layout} で全行一致を確認する——に従うこと。
+いずれも将来対応するときは、今回と同じ方針
+——本物の材料と本物の規則書だけを使い、答え合わせ機で全行一致を確認する——で行います。
+
+%======================================================================
+\section{ミニ用語集}
+
+\begin{description}
+\item[LaTeX（ラテフ）/ lualatex] 文書組版システムの定番と、その現行エンジン。
+  原稿（テキストファイル）から美しい PDF を作る。
+\item[組版（くみはん）] 文字や図を紙面のどこに、どんな間隔で置くかを決める作業。
+\item[プレビュー] 編集画面の横に出る「仕上がりの見た目」。本エンジンでは
+  打った瞬間に更新され、印刷結果と一致する。
+\item[ブロック] 文書を段落や見出し単位で区切ったもの。差分更新の最小単位。
+\item[セーブポイント（チェックポイント）] あるブロックまで処理し終えた LaTeX の
+  作業状態の丸ごと保存。OS の fork 機能で一瞬で作れる。
+\item[フロート] 図や表を「このへんに置いて」とだけ指定し、実際の置き場所
+  （ページ上部・下部など）を LaTeX が自動で決める仕組み。
+\item[bp（ビッグポイント）] 長さの単位。1 bp ≒ 0.353 mm。PDF の内部座標に使われる。
+\item[TikZ（ティクス）] LaTeX の中でグラフや図形を描くための作図機能。
+\end{description}
+
+%======================================================================
+\section{もっと詳しく知りたい人へ}
+
+エンジニア向けの完全な技術詳解（全 7 章、日本語）がリポジトリの \code{docs/} にあります。
+第 1 章が TeX の背景知識、第 3 章が本エンジンの心臓部（セーブポイント機構と
+今回の完全一致システム）、第 6 章が開発中に踏んだ罠の記録です。
+また、答え合わせ機は \code{tools/verify-layout.mjs} として同梱されており、
+任意の文書で「プレビュー＝本物の PDF」を誰でも検証できます。
 
 \vspace{1.5em}
 \begin{center}
 \rule{0.6\textwidth}{0.4pt}\\[0.5em]
-\small 本書自体も検証対象と同じ \code{lualatex}（LuaHBTeX, TeX Live 2024）で組版されている。
+\small この文書自体も、本エンジンの検証対象と同じ lualatex で組版されています。
 \end{center}
 
 \end{document}
