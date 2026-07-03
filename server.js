@@ -176,7 +176,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/templates') return json(res, listTemplates());
     if (req.method === 'GET' && url.pathname === '/dom') return json(res, engine.getDOM());
     if (req.method === 'GET' && url.pathname.startsWith('/chunk/')) {
-      const id = url.pathname.slice('/chunk/'.length).replace(/\.svg$/, '');
+      const id = decodeURIComponent(url.pathname.slice('/chunk/'.length)).replace(/\.svg$/, '');
       const svg = engine.getChunkSVG ? engine.getChunkSVG(id) : null;
       if (!svg) {
         res.writeHead(404);

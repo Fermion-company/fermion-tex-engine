@@ -1,5 +1,6 @@
 .tdom-cache*/
 .tdom-v3*/
 .tdom-dbg/
+.tdom-iso/
 node_modules/
 recovered-document.tex

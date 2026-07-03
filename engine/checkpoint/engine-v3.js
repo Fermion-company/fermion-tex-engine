@@ -27,7 +27,7 @@ import { performance } from 'node:perf_hooks';
 import { SourceStore } from '../source-store.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
-import { buildPages, reconcile } from './pagebuilder.js';
+import { buildPages, reconcile, parsePlacement } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
 import { statSync, watch } from 'node:fs';
 
@@ -358,8 +358,6 @@ export class CheckpointEngine {
     L.push('\\begin{document}');
     L.push(`\\directlua{dofile('${luaStr(path.join(DIR, 'daemon.lua'))}')}`);
     L.push('\\makeatletter');
-    L.push('\\newbox\\TDOMgalley');
-    L.push('\\directlua{TDOM_BOXNUM=\\number\\TDOMgalley}');
     L.push(
       `\\directlua{tdom_boot(${this.port}, '${luaStr(this.workDir)}', {${this.counters
         .map((c) => `'${c}'`)
@@ -382,17 +380,23 @@ export class CheckpointEngine {
     L.push('\\let\\TDOMcite\\cite');
     L.push("\\renewcommand\\cite[2][]{\\directlua{tdom_cites('\\luaescapestring{#2}')}" +
       '\\ifx\\relax#1\\relax\\TDOMcite{#2}\\else\\TDOMcite[#1]{#2}\\fi}');
-    // float capture: environments typeset into a box that the daemon walks;
-    // an anchor \special marks the declaration point for the page builder
+    // float capture: the environment body is typeset into a box with EXACTLY
+    // the setup of LaTeX's \@xfloat (\hsize\columnwidth \@parboxrestore
+    // \@floatboxreset — and no injected \centering), so the captured box is
+    // byte-identical to what the real output routine would have placed. An
+    // anchor \special marks the declaration point for the page builder.
     L.push('\\newbox\\TDOMfloatbox');
     L.push('\\directlua{TDOM_FLOATBOX=\\number\\TDOMfloatbox}');
     L.push('\\newcount\\TDOMfloatn');
     for (const env of ['figure', 'table']) {
       L.push(
-        `\\renewenvironment{${env}}[1][tbp]{\\gdef\\TDOMfp{#1}\\def\\@captype{${env}}` +
-          '\\global\\setbox\\TDOMfloatbox\\vbox\\bgroup\\hsize\\textwidth\\centering}' +
-          `{\\egroup\\global\\advance\\TDOMfloatn\\@ne\\special{tdomfloat:\\number\\TDOMfloatn}` +
-          `\\directlua{tdom_float(\\number\\TDOMfloatn,'\\TDOMfp','${env}')}\\ignorespaces}`
+        `\\renewenvironment{${env}}[1][\\csname fps@${env}\\endcsname]` +
+          `{\\gdef\\TDOMfp{#1}\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
+          '\\global\\setbox\\TDOMfloatbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset}' +
+          `{\\par\\vskip\\z@skip\\egroup\\global\\advance\\TDOMfloatn\\@ne` +
+          `\\special{tdomfloat:\\number\\TDOMfloatn}` +
+          `\\directlua{tdom_float(\\number\\TDOMfloatn,'\\TDOMfp','${env}')}` +
+          `\\ifhmode\\@Esphack\\fi}`
       );
     }
     // \tableofcontents reads the toc the orchestrator maintains; never write
@@ -402,13 +406,38 @@ export class CheckpointEngine {
     L.push("\\def\\@bibitem#1{\\TDOMbibitem{#1}\\directlua{tdom_bib('\\luaescapestring{#1}','\\luaescapestring{\\the\\value{enumiv}}')}}\\fi");
     L.push('\\ifdefined\\@lbibitem\\let\\TDOMlbibitem\\@lbibitem');
     L.push("\\def\\@lbibitem[#1]#2{\\TDOMlbibitem[#1]{#2}\\directlua{tdom_bib('\\luaescapestring{#2}','\\luaescapestring{#1}')}}\\fi");
-    // page-builder geometry (skips are read as their natural widths)
-    L.push('\\directlua{tdom_dim(\'footinsskip\',\\number\\dimexpr\\skip\\footins\\relax)}');
-    L.push('\\directlua{tdom_dim(\'floatsep\',\\number\\dimexpr\\floatsep\\relax)}');
-    L.push('\\directlua{tdom_dim(\'textfloatsep\',\\number\\dimexpr\\textfloatsep\\relax)}');
-    L.push('\\directlua{tdom_dim(\'intextsep\',\\number\\dimexpr\\intextsep\\relax)}');
+    // page-builder geometry: every parameter the output routine uses is read
+    // from the live TeX run — glue parameters travel with their full
+    // stretch/shrink specification (\gluestretch etc. are LuaTeX primitives)
+    const glueParam = (name, expr) =>
+      `\\directlua{tdom_glue('${name}',\\number\\dimexpr${expr}\\relax,` +
+      `\\number\\gluestretch${expr},\\number\\glueshrink${expr},` +
+      `\\number\\gluestretchorder${expr},\\number\\glueshrinkorder${expr})}`;
+    L.push(glueParam('footinsskip', '\\skip\\footins'));
+    L.push(glueParam('topskip', '\\topskip'));
+    L.push(glueParam('floatsep', '\\floatsep'));
+    L.push(glueParam('textfloatsep', '\\textfloatsep'));
+    L.push(glueParam('intextsep', '\\intextsep'));
+    L.push(glueParam('fptop', '\\@fptop'));
+    L.push(glueParam('fpsep', '\\@fpsep'));
+    L.push(glueParam('fpbot', '\\@fpbot'));
     L.push('\\directlua{tdom_num(\'topfraction\',\\topfraction)}');
     L.push('\\directlua{tdom_num(\'bottomfraction\',\\bottomfraction)}');
+    L.push('\\directlua{tdom_num(\'textfraction\',\\textfraction)}');
+    L.push('\\directlua{tdom_num(\'floatpagefraction\',\\floatpagefraction)}');
+    L.push('\\directlua{tdom_num(\'topnumber\',\\value{topnumber})}');
+    L.push('\\directlua{tdom_num(\'bottomnumber\',\\value{bottomnumber})}');
+    L.push('\\directlua{tdom_num(\'totalnumber\',\\value{totalnumber})}');
+    L.push('\\directlua{tdom_num(\'interlinepenalty\',\\interlinepenalty)}');
+    L.push('\\directlua{tdom_num(\'footinsfactor\',\\count\\footins)}');
+    L.push('\\directlua{tdom_dim(\'atmaxdepth\',\\number\\dimexpr\\@maxdepth\\relax)}');
+    // \raggedbottom leaves \@textbottom = \vskip\z@\@plus.0001fil; flushbottom
+    // keeps it \relax — the page builder needs to know which world it's in
+    L.push('\\ifx\\@textbottom\\relax\\directlua{tdom_num(\'raggedbottom\',0)}' +
+      '\\else\\directlua{tdom_num(\'raggedbottom\',1)}\\fi');
+    // the class's real \footnoterule, measured (kerns+rule items, verbatim)
+    L.push('\\setbox0=\\vbox{\\hsize=\\textwidth\\footnoterule}');
+    L.push('\\directlua{tdom_footrule(0)}');
     L.push('\\directlua{tdom_geo()}');
     // pre-known labels so forward references resolve in one pass after reboots
     for (const [key, val] of this.labelTable) {
@@ -431,6 +460,23 @@ export class CheckpointEngine {
     // cancel TeX's 1in shipout origin so render children produce tight pages
     L.push('\\hoffset=-1in');
     L.push('\\voffset=-1in');
+    // Dormant page builder: blocks are typeset on the REAL main vertical
+    // list (full state continuity — \prevdepth, \everypar, penalties), the
+    // page never fills (\vsize=\maxdimen), inserts stay in the stream
+    // (\holdinginserts), and a dummy box keeps the page "started" so TeX
+    // never discards inter-block glue. tdom_report() harvests the nodes.
+    // The output routine only ever fires on force-ejects (\newpage & co);
+    // tdom_absorb_output puts the material back and plants a break marker.
+    L.push('\\vsize=\\maxdimen');
+    L.push('\\holdinginserts=1');
+    L.push('\\maxdeadcycles=200');
+    L.push('\\output={\\directlua{tdom_absorb_output()}}');
+    // a real box first: flips the page builder's internal page_contents
+    // flag to box_there (unreachable from Lua); tdom_seed then swaps the
+    // list for the marker dummy
+    L.push('\\hbox to0pt{}');
+    L.push('\\prevdepth=-1000pt');
+    L.push('\\directlua{tdom_seed()}');
     L.push('\\def\\TDOMloop{\\directlua{tdom_wait()}\\TDOMloop}');
     L.push('\\TDOMloop');
     L.push('\\end{document}');
@@ -444,7 +490,6 @@ export class CheckpointEngine {
     const block = this.blocks[idx];
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
-    const noindent = this.#noindentFor(idx);
     // Labels are defined in descendant lineages only; when resuming from an
     // ancestor snapshot, forward-referenced values must be injected so this
     // block sees the document-wide truth.
@@ -464,14 +509,20 @@ export class CheckpointEngine {
     const prelude = defs.length
       ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
       : '';
-    const body = Buffer.from(prelude + block.text, 'utf8');
+    // Mid-typing safety: an unclosed brace makes a \long macro argument
+    // scan past the injected \par/report tokens to EOF and kills the child
+    // (the old \vbox wrapper stopped it structurally). Auto-close the
+    // imbalance — the source is transiently invalid anyway, and the exact
+    // path resumes on the next balanced keystroke.
+    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
+    const body = Buffer.from(prelude + block.text + guard, 'utf8');
     const galleyKey = 'galley:' + block.id;
     const ckptKey = 'ckpt:' + (idx + 1);
     const galleyP = this.#await(galleyKey);
     const ckptP = this.#await(ckptKey);
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
     try {
-      ck.send(`JOB ${block.id} ${idx + 1} ${noindent ? 1 : 0}:${body.length}\n`);
+      ck.send(`JOB ${block.id} ${idx + 1} ${body.length}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
       this.#retireOffGrid(idx);
@@ -507,12 +558,43 @@ export class CheckpointEngine {
     return best;
   }
 
+  /**
+   * Retypeset blocks from `from` at least through `target`, then keep going
+   * until a re-typeset block reproduces its previous galley AND exit state
+   * (counters + prevdepth + \if@nobreak) exactly. Cross-block layout state
+   * makes downstream galleys stale after ANY upstream re-typeset — the same
+   * self-verifying convergence as the main edit path, factored out so the
+   * toc and backward-reference passes cannot cut the chain short.
+   * Returns the number of blocks typeset; reports (idx, changed) per block.
+   */
+  async #retypesetChain(from, target, onBlock) {
+    let n = 0;
+    for (let j = from; j < this.blocks.length; j++) {
+      const block = this.blocks[j];
+      const before = { hash: block.galleyHash, state: block.stateVec };
+      const g = await this.#jobBlock(j).catch(() => null);
+      if (!g) break;
+      this.#adoptGalley(block, g);
+      n++;
+      const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
+      onBlock?.(j, changed);
+      if (j >= target && !changed) break;
+    }
+    return n;
+  }
+
   #adoptGalley(block, galley) {
     block.galley = galley;
     block.galleyHash = fnv1a(
       JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d])
     );
-    block.stateVec = JSON.stringify(this.counters.map((c) => galley.state?.[c] ?? 0));
+    // exit state = tracked counters + cross-block layout state (prevdepth,
+    // \if@nobreak) — any change forces the convergence chain onward
+    block.stateVec = JSON.stringify([
+      ...this.counters.map((c) => galley.state?.[c] ?? 0),
+      galley.state?.['tdom@pd'] ?? 0,
+      galley.state?.['tdom@nobreak'] ?? 0,
+    ]);
     block.gfx = !!galley.gfx;
     block.needsRender = block.gfx || (galley.floats ?? []).some((f) => f.gfx);
     block.consumesToc = /\\tableofcontents\b/.test(block.text);
@@ -547,11 +629,6 @@ export class CheckpointEngine {
       remap: legacy?.map ?? null,
       omx: !!legacy?.omx,
     });
-  }
-
-  #noindentFor(idx) {
-    if (idx === 0) return true;
-    return HEADING_RE.test(this.blocks[idx - 1].text);
   }
 
   // ------------------------------------------------------------- update
@@ -691,19 +768,17 @@ export class CheckpointEngine {
         );
         if (!hit) continue;
         const from = this.#nearestCheckpoint(c);
-        for (let j = from; j <= c && j < this.blocks.length; j++) {
-          const g = await this.#jobBlock(j).catch(() => null);
-          if (!g) break;
-          const beforeHash = this.blocks[j].galleyHash;
-          this.#adoptGalley(this.blocks[j], g);
+        await this.#retypesetChain(from, c, (j, changed) => {
           typesetCount++;
-          if (j === c && this.blocks[j].galleyHash !== beforeHash) {
+          if (j === c && changed) {
             dirtyBlocks.push(block.id);
             for (const k of block.galley.refs ?? []) {
               if (changedLabels.has(k)) push2(depDirty, 'label', k, block.id);
             }
+          } else if (j > c && changed) {
+            dirtyBlocks.push(this.blocks[j].id);
           }
-        }
+        });
       }
     }
     t.lap('typeset');
@@ -731,17 +806,13 @@ export class CheckpointEngine {
         if (!block.consumesToc) continue;
         anyConsumer = true;
         const from = this.#nearestCheckpoint(c);
-        for (let j = from; j <= c && j < this.blocks.length; j++) {
-          const g = await this.#jobBlock(j).catch(() => null);
-          if (!g) break;
-          const beforeHash = this.blocks[j].galleyHash;
-          this.#adoptGalley(this.blocks[j], g);
+        await this.#retypesetChain(from, c, (j, changed) => {
           typesetCount++;
-          if (j === c && this.blocks[j].galleyHash !== beforeHash) {
-            dirtyBlocks.push(block.id);
-            push2(depDirty, 'toc', 'contents', block.id);
+          if (changed && j >= c) {
+            dirtyBlocks.push(this.blocks[j].id);
+            if (j === c) push2(depDirty, 'toc', 'contents', block.id);
           }
-        }
+        });
       }
       if (!anyConsumer) break;
     }
@@ -829,21 +900,37 @@ export class CheckpointEngine {
         if (block.galleyHash !== before) {
           // late-discovered change (rare): patch through the async channel
           this.#asyncRepaginate();
+          if (block.needsRender) {
+            this.renderTask = (this.renderTask ?? Promise.resolve()).then(() =>
+              this.#renderBlock(block).catch((err) => {
+                this.diagnostics.push(`render ${block.id}: ${err.message}`);
+              })
+            );
+          }
         }
       }
     })();
+    const renders = [];
+    const fresh = (key, block) => {
+      const c = this.chunks.get(key);
+      return !!c && c.forGalley === block.galleyHash;
+    };
     for (const block of this.blocks) {
       const missingChunk =
-        (block.gfx && !this.chunks.has(block.id)) ||
-        (block.galley?.floats ?? []).some((f) => f.gfx && !this.chunks.has(block.id + '#' + f.n));
+        (block.gfx && !fresh(block.id, block)) ||
+        (block.galley?.floats ?? []).some((f) => f.gfx && !fresh(block.id + '#' + f.n, block));
       if (block.needsRender && (dirtyBlocks.includes(block.id) || missingChunk)) {
-        this.bgTask
-          .then(() => this.#renderBlock(block))
-          .catch((err) => {
-            this.diagnostics.push(`render ${block.id}: ${err.message}`);
-          });
+        renders.push(
+          this.bgTask
+            .then(() => this.#renderBlock(block))
+            .catch((err) => {
+              this.diagnostics.push(`render ${block.id}: ${err.message}`);
+            })
+        );
       }
     }
+    // exposed so tools/tests can wait for the exact-render tier to settle
+    this.renderTask = Promise.all(renders).then(() => {});
   }
 
   async #renderBlock(block) {
@@ -863,13 +950,16 @@ export class CheckpointEngine {
     const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
     mkdirSync(jobdir, { recursive: true });
     rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
-    const body = Buffer.from(block.text, 'utf8');
+    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
+    const body = Buffer.from(block.text + guard, 'utf8');
     const done = this.#await('render:' + block.id, 60_000);
     ck.send(`RENDER ${block.id} ${jobdir} ${body.length}\n`);
     ck.sendRaw(body);
     await done;
     const pdf = path.join(jobdir, 'driver.pdf');
-    if (!existsSync(pdf)) throw new Error('render child produced no PDF');
+    // DONE fires from finish_pdffile, but the child's stdio buffers reach
+    // the disk only on _exit — wait until the file is complete (%%EOF)
+    await waitForPdf(pdf);
     // page 1 = the block galley; pages 2..N = its float boxes in order
     const targets = [];
     if (block.gfx) {
@@ -887,7 +977,7 @@ export class CheckpointEngine {
         ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
         { timeout: 30_000 }
       );
-      const svg = readFileSync(svgPath, 'utf8');
+      const svg = cropSvg(readFileSync(svgPath, 'utf8'), tgt.w, tgt.h);
       const prev = this.chunks.get(tgt.key);
       this.chunks.set(tgt.key, {
         svg,
@@ -928,6 +1018,11 @@ export class CheckpointEngine {
       this.counters.forEach((c, i) => {
         entry[c] = prevVec[i] ?? 0;
       });
+      // cross-block layout state from the previous block's REAL exit vector:
+      // [..counters.., tdom@pd, tdom@nobreak] — prevdepth reproduces the
+      // exact leading interline glue, @nobreak the post-heading \everypar
+      const prevPd = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] : -65536000;
+      const prevNobreak = idx > 0 && prevVec.length >= 1 ? prevVec[prevVec.length - 1] === 1 : false;
       const text = this.store.get(this.file);
       const bounds = documentBounds(text);
       const L = [];
@@ -942,13 +1037,39 @@ export class CheckpointEngine {
         L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
       }
       L.push('\\makeatother');
-      L.push('\\setbox0=\\vbox{\\hsize=\\textwidth');
-      if (this.#noindentFor(idx)) L.push('\\noindent');
-      L.push(block.text.trimEnd());
-      L.push('\\par}');
-      L.push('\\directlua{local b=tex.box[0] tex.pagewidth=math.max(b.width or 0,65536) tex.pageheight=math.max((b.height or 0)+(b.depth or 0),65536)}');
-      L.push('\\shipout\\box0');
-      L.push('\\end{document}');
+      // same dormant-page technique as the resident daemon: typeset on the
+      // real MVL (state-faithful spacing), then harvest, vpack and ship
+      L.push('\\vsize=\\maxdimen');
+      L.push('\\holdinginserts=1');
+      L.push('\\maxdeadcycles=200');
+      L.push('\\hbox to0pt{}');
+      L.push('\\special{tdom:isostart}');
+      L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
+      if (prevNobreak) L.push('\\noindent');
+      L.push(block.text.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(block.text))));
+      L.push('\\par');
+      L.push(
+        '\\directlua{' +
+          'tex.triggerbuildpage() ' +
+          'local head = tex.lists.page_head ' +
+          'tex.lists.page_head = nil tex.lists.contrib_head = nil ' +
+          'local INS = node.id("ins") local WH = node.id("whatsit") ' +
+          'local SP = node.subtype("special") ' +
+          // everything up to and including the isostart marker is pre-body
+          // machinery (begin-document whatsits, \topskip glue, the seed box)
+          'while head do ' +
+          'local ismark = head.id == WH and head.subtype == SP and head.data == "tdom:isostart" ' +
+          'local nxt = head.next head.next = nil if nxt then nxt.prev = nil end node.free(head) head = nxt ' +
+          'if ismark then break end end ' +
+          'local out, tail = nil, nil local n = head ' +
+          'while n do local nxt = n.next n.next = nil n.prev = nil ' +
+          'if n.id == INS then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
+          'if out then local b = node.vpack(out) ' +
+          'tex.box[255] = b tex.pagewidth = math.max(b.width or 0, 65536) ' +
+          'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end}'
+      );
+      L.push('\\shipout\\box255');
+      L.push('\\csname @@end\\endcsname');
       const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
       mkdirSync(jobdir, { recursive: true });
       rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
@@ -961,7 +1082,14 @@ export class CheckpointEngine {
       if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
       const svgPath = path.join(jobdir, 'iso.svg');
       await execFileP('pdftocairo', ['-svg', '-f', '1', '-l', '1', pdf, svgPath], { timeout: 30_000 });
-      const svg = readFileSync(svgPath, 'utf8');
+      // the shipped page can come out paper-sized when a class hooks the
+      // shipout (luatexja); the box sits at the origin (\hoffset=-1in), so
+      // cropping the viewBox to the known galley extent is always exact
+      const svg = cropSvg(
+        readFileSync(svgPath, 'utf8'),
+        block.galley.w,
+        block.galley.h + block.galley.d
+      );
       const prev = this.chunks.get(block.id);
       this.chunks.set(block.id, {
         svg,
@@ -1010,8 +1138,6 @@ export class CheckpointEngine {
   }
 
   #rebuildUnits() {
-    const geo = this.geometry;
-    let prevLastBox = null;
     for (const block of this.blocks) {
       const bc = this.chunks.get(block.id);
       const hasChunk = !!bc && bc.forGalley === block.galleyHash;
@@ -1021,15 +1147,11 @@ export class CheckpointEngine {
           return fc && fc.forGalley === block.galleyHash ? fc.v : 0;
         })
         .join(',');
-      const sig = `${block.galleyHash}|${prevLastBox ? prevLastBox.d : 'x'}|${
-        hasChunk ? bc.v : 0
-      }|${floatVs}`;
+      const sig = `${block.galleyHash}|${hasChunk ? bc.v : 0}|${floatVs}`;
       if (!block.units || block.unitsSig !== sig) {
-        block.units = buildUnits(block, geo, prevLastBox, hasChunk, this.chunks);
+        block.units = buildStream(block, hasChunk, this.chunks);
         block.unitsSig = sig;
       }
-      const boxes = (block.galley?.items ?? []).filter((it) => it.k === 'box');
-      if (boxes.length) prevLastBox = boxes[boxes.length - 1];
     }
   }
 
@@ -1049,6 +1171,9 @@ export class CheckpointEngine {
     const lines = [];
     for (const block of this.blocks) {
       const m = block.text.match(/^\s*\\(section|subsection|subsubsection)(\*?)\s*\{/);
+      if (process.env.TDOM_DEBUG_TOC && /\\section/.test(block.text)) {
+        console.error(`toc? ${block.id} m=${!!m} star=${m?.[2]} sv=${!!block.stateVec} text=${JSON.stringify(block.text.slice(0, 40))}`);
+      }
       if (!m || m[2] === '*' || !block.stateVec) continue;
       const vec = JSON.parse(block.stateVec);
       const title = extractBraced(block.text, block.text.indexOf('{', m.index));
@@ -1137,18 +1262,6 @@ export class CheckpointEngine {
     };
 
     for (const entry of page.draw ?? []) {
-      if (entry.rule) {
-        flushGfx();
-        commands.push({
-          op: 'rule',
-          x: r2(L),
-          y: r2(T + entry.y),
-          w: r2(entry.rule.w),
-          h: r2(entry.rule.h),
-          src: '_footrule',
-        });
-        continue;
-      }
       const u = entry.u;
       const baseline = T + entry.y;
       if (u.ln.gfxChunk) {
@@ -1156,7 +1269,7 @@ export class CheckpointEngine {
         const unitTop = baseline - u.ln.boxH;
         const chunkTop = unitTop - c.yOff;
         const clip0 = c.yOff;
-        const clip1 = c.yOff + u.h;
+        const clip1 = c.yOff + u.h + (u.d ?? 0);
         if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
           gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         } else {
@@ -1210,10 +1323,13 @@ export class CheckpointEngine {
       }
     }
     flushGfx();
+    // page style plain: \@thefoot = \hfil\thepage\hfil in an \hbox appended
+    // with \baselineskip=\footskip — the folio baseline lands exactly
+    // \footskip below the text area (see \@outputpage)
     commands.push({
       op: 'folio',
-      x: r2(geo.paperwidth / 2),
-      y: r2(geo.paperheight - Math.max(36, (geo.paperheight - T - geo.textheight) / 2)),
+      x: r2(L + geo.textwidth / 2),
+      y: r2(T + geo.textheight + (geo.footskip ?? 30)),
       text: String(page.number),
     });
     const dl = { page: page.number, commands };
@@ -1309,19 +1425,18 @@ class Peer {
 // ------------------------------------------------------------- helpers
 
 /**
- * galley items -> pagination units. Footnote inserts attach to their line's
- * unit; float anchors become float objects carrying their own mini-galleys.
+ * galley items -> the page builder's input stream. The items ARE the real
+ * main vertical list (boxes, glue with full specs, penalties, inserts,
+ * float anchors, eject markers) — this function only reshapes them into
+ * stream entries and attaches drawing/chunk metadata. Entry objects are
+ * cached per block (unitsSig), so page identity survives unrelated edits.
  */
-function buildUnits(block, geo, prevLastBox, hasChunk, chunks) {
+function buildStream(block, hasChunk, chunks) {
   const items = block.galley?.items ?? [];
   const floats = block.galley?.floats ?? [];
-  const units = [];
-  let pending = 0;
+  const stream = [];
   let li = 0;
-  let first = true;
-  let lastUnit = null;
   let yOff = 0;
-  const pendingIns = [];
 
   const makeFloat = (n) => {
     const f = floats.find((x) => x.n === n);
@@ -1332,10 +1447,12 @@ function buildUnits(block, geo, prevLastBox, hasChunk, chunks) {
       f.gfx && fc && fc.forGalley === block.galleyHash ? { key: chunkKey, w: f.w } : null;
     return {
       id: chunkKey,
-      placement: f.placement,
+      n: f.n,
+      place: parsePlacement(f.placement),
       type: f.type,
       w: f.w,
-      h: (f.h ?? 0) + (f.d ?? 0),
+      h: f.h ?? 0,
+      d: f.d ?? 0,
       gfx: f.gfx,
       blockId: block.id,
       units: miniUnits(f.items, block.id, chunkRef),
@@ -1343,82 +1460,54 @@ function buildUnits(block, geo, prevLastBox, hasChunk, chunks) {
   };
 
   for (const it of items) {
-    if (it.k === 'glue' || it.k === 'kern') {
-      pending += it.a ?? 0;
+    if (it.k === 'glue') {
+      stream.push({ t: 'glue', a: it.a ?? 0, st: it.st ?? 0, sto: it.sto ?? 0, sh: it.sh ?? 0, sho: it.sho ?? 0, sub: it.sub ?? 0 });
       yOff += it.a ?? 0;
-      continue;
-    }
-    if (it.k === 'pen') {
-      if ((it.v ?? 0) >= 10000 && lastUnit) lastUnit.keepWithNext = true;
-      continue;
-    }
-    if (it.k === 'ins') {
-      const ins = { units: miniUnits(it.items, block.id, null), h: it.h ?? 0 };
-      if (lastUnit) (lastUnit.inserts ??= []).push(ins);
-      else pendingIns.push(ins);
-      continue;
-    }
-    let pre = pending;
-    if (first) {
-      if (prevLastBox) {
-        const inter = Math.max(
-          geo.lineskip ?? 1,
-          (geo.baselineskip ?? 14.5) - (prevLastBox.d ?? 0) - (it.h ?? 0)
-        );
-        pre += inter + (geo.parskip ?? 0);
-      }
-      first = false;
-    }
-    const unit = {
-      blockId: block.id,
-      li: li++,
-      h: (it.h ?? 0) + (it.d ?? 0),
-      pre,
-      post: 0,
-      keepWithNext: false,
-      ln: {
-        descent: it.d ?? 0,
-        // height above the baseline only: pagination stores the baseline as
-        // top + boxH, and the display list recovers the top from it.
-        boxH: it.h ?? 0,
-        runs: it.runs ?? [],
-        gfxChunk:
-          block.gfx && hasChunk
-            ? { blockId: block.id, yOff, w: block.galley.w }
-            : null,
-      },
-    };
-    if (pendingIns.length) unit.inserts = pendingIns.splice(0);
-    if (it.fm) {
-      for (const n of it.fm) {
-        const f = makeFloat(n);
-        if (f) (unit.floats ??= []).push(f);
+    } else if (it.k === 'kern') {
+      stream.push({ t: 'kern', a: it.a ?? 0 });
+      yOff += it.a ?? 0;
+    } else if (it.k === 'pen') {
+      stream.push({ t: 'pen', v: it.v ?? 0 });
+    } else if (it.k === 'ins') {
+      stream.push({
+        t: 'ins',
+        h: it.h ?? it.hc ?? 0,
+        d: it.d ?? 0,
+        hc: it.hc ?? it.h ?? 0,
+        units: miniUnits(it.items, block.id, null),
+      });
+    } else if (it.k === 'fm') {
+      const f = makeFloat(it.n);
+      if (f) stream.push({ t: 'fm', f, vmode: true });
+    } else if (it.k === 'eject') {
+      stream.push({ t: 'eject', v: it.v ?? -10000 });
+    } else if (it.k === 'box') {
+      const unit = {
+        blockId: block.id,
+        li: li++,
+        h: it.h ?? 0,
+        d: it.d ?? 0,
+        ln: {
+          descent: it.d ?? 0,
+          boxH: it.h ?? 0,
+          runs: it.runs ?? [],
+          gfxChunk:
+            block.gfx && hasChunk
+              ? { blockId: block.id, yOff, w: block.galley.w }
+              : null,
+        },
+      };
+      stream.push({ t: 'box', u: unit });
+      yOff += (it.h ?? 0) + (it.d ?? 0);
+      if (it.fm) {
+        for (const n of it.fm) {
+          const f = makeFloat(n);
+          if (f) stream.push({ t: 'fm', f, vmode: false });
+        }
       }
     }
-    units.push(unit);
-    lastUnit = unit;
-    pending = 0;
-    yOff += (it.h ?? 0) + (it.d ?? 0);
   }
-  if (lastUnit) {
-    lastUnit.post += pending;
-    if (pendingIns.length) (lastUnit.inserts ??= []).push(...pendingIns);
-  }
-  // float-only blocks: anchor floats to a zero-height carrier unit
-  if (!units.length && floats.length) {
-    units.push({
-      blockId: block.id,
-      li: 0,
-      h: 0.01,
-      pre: 0,
-      post: 0,
-      keepWithNext: false,
-      ln: { descent: 0, boxH: 0.01, runs: [], gfxChunk: null },
-      floats: floats.map((f) => makeFloat(f.n)).filter(Boolean),
-    });
-  }
-  if (HEADING_RE.test(block.text) && lastUnit) lastUnit.keepWithNext = true;
-  return units;
+  return stream;
 }
 
 /** Convert a captured mini-galley (float body, footnote text) to draw units. */
@@ -1433,7 +1522,8 @@ function miniUnits(items, blockId, chunkRef) {
     if (it.k !== 'box') continue;
     units.push({
       blockId,
-      h: (it.h ?? 0) + (it.d ?? 0),
+      h: it.h ?? 0,
+      d: it.d ?? 0,
       yRel: y + (it.h ?? 0), // baseline relative to the mini-galley top
       ln: {
         descent: it.d ?? 0,
@@ -1511,8 +1601,51 @@ function resolveFont(name) {
   }
 }
 
+/**
+ * Normalize a pdftocairo page SVG to the exact box extent (bp): content is
+ * anchored at the origin by the driver's \hoffset/\voffset, so setting the
+ * viewBox crops precisely regardless of the page size the ship went out at.
+ */
+function cropSvg(svg, wBp, hBp) {
+  return svg.replace(
+    /<svg([^>]*?)width="[^"]*" height="[^"]*" viewBox="[^"]*"/,
+    `<svg$1width="${wBp}pt" height="${hBp}pt" viewBox="0 0 ${wBp} ${hBp}"`
+  );
+}
+
+/** Wait until a PDF file exists and ends with %%EOF (flushed completely). */
+async function waitForPdf(p, timeoutMs = 5000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const buf = readFileSync(p);
+      if (buf.length > 8 && buf.subarray(-32).toString('latin1').includes('%%EOF')) return;
+    } catch {
+      /* not there yet */
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error('render child produced no complete PDF');
+}
+
 function luaStr(s) {
   return s.replace(/\\/g, '/').replace(/'/g, "\\'");
+}
+
+/** Net {…} depth of a block (comments stripped, \{ \} ignored). */
+function braceImbalance(text) {
+  let d = 0;
+  for (const line of text.split('\n')) {
+    let s = line;
+    const ci = s.search(/(?<!\\)%/);
+    if (ci >= 0) s = s.slice(0, ci);
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '\\') { i++; continue; }
+      if (s[i] === '{') d++;
+      else if (s[i] === '}') d--;
+    }
+  }
+  return d;
 }
 
 function push2(list, kind, key, blockId) {

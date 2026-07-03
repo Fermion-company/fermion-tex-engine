@@ -107,7 +107,7 @@ function renderPage(dl, flash) {
       div.insertAdjacentHTML(
         'beforeend',
         `<div class="chunkwin" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
-          `<img class="chunk" src="/chunk/${cmd.chunk}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+          `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
       );
     }
   } else {
@@ -137,7 +137,7 @@ function chunkSheet(dl) {
       const shift = (cmd.sy / cmd.w) * 100;
       parts.push(
         `<div class="chunkwin" data-src="${cmd.src}" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%">` +
-          `<img class="chunk" src="/chunk/${cmd.chunk}.svg" style="margin-top:-${shift}%" draggable="false">` +
+          `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg" style="margin-top:-${shift}%" draggable="false">` +
           `</div>`
       );
     } else if (cmd.op === 'folio') {

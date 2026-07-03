@@ -7,15 +7,19 @@
 -- last valid snapshot — so the visible cost of a keystroke is one paragraph
 -- of Knuth-Plass plus IPC.
 --
--- Per job child:
---   1. typeset the block into \box\TDOMgalley (main vertical list untouched,
---      PDF backend stays virgin so descendants can still ship pages)
---   2. walk the node lists and report a glyph-precise galley (positions from
---      node.effective_glue — exactly what would have been shipped)
---   3. become the next checkpoint and wait for further commands
+-- THE EXACTNESS CONTRACT (v3.2): blocks are typeset on the REAL main
+-- vertical list — no \vbox wrapper, no group. TeX's page builder is kept
+-- dormant (\vsize=\maxdimen, a dummy box keeps the page "started" so nothing
+-- is discarded, \holdinginserts=1 keeps footnotes in the stream) and after
+-- each block the freshly contributed MVL nodes are harvested from
+-- tex.lists.page_head. The harvested stream is BYTE-IDENTICAL to what a
+-- vanilla run of lualatex builds for the whole document: inter-paragraph
+-- glue, \parskip, \addvspace, club/widow penalties, \everypar effects and
+-- \prevdepth all come from the same continuous TeX run — the orchestrator's
+-- page builder never invents a single dimension.
 --
--- Render children (for TikZ/pdf-literal blocks) chdir into a job directory,
--- \shipout the galley and finalize a real PDF, then exit.
+-- Render children (exact-render tier) harvest the same nodes, vpack them
+-- and \shipout a real PDF page, so the chunk pixels are the PDF's pixels.
 
 local fk = nil
 local sock = nil
@@ -37,7 +41,11 @@ local RENDER_MODE = false
 local FLOAT_COPIES = {}
 
 local SP2BP = 65781.76
-local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000 + 0.5) / 1000 end
+-- 6 decimals: page assembly sums hundreds of these; 3 decimals accumulated
+-- into ~0.1bp glue-set drift over a full page
+local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1000000 end
+
+local DUMMY_ATTR = 8123
 
 -- ---------------------------------------------------------------- json
 
@@ -105,6 +113,8 @@ function tdom_geo()
     topmargin = dim('topmargin'),
     headheight = dim('headheight'),
     headsep = dim('headsep'),
+    footskip = dim('footskip'),
+    maxdepth = bp(tex.maxdepth or 0),
     baselineskip = bp(tex.baselineskip.width or 0),
     lineskip = bp(tex.lineskip.width or 0),
     parskip = bp(tex.parskip.width or 0),
@@ -175,13 +185,35 @@ function tdom_bib(key, value)
   end)
 end
 
--- geometry extras collected before tdom_geo (skips/fractions from LaTeX)
+-- geometry extras collected before tdom_geo (dimens/counts from LaTeX)
 function tdom_dim(name, sp)
   geo_extra[name] = bp(tonumber(sp) or 0)
 end
 
 function tdom_num(name, value)
   geo_extra[name] = tonumber(value) or 0
+end
+
+-- full glue parameters: natural, stretch, shrink + orders (driver sends the
+-- components via \gluestretch etc. so nothing is approximated)
+function tdom_glue(name, w, st, sh, sto, sho)
+  geo_extra[name] = {
+    w = bp(tonumber(w) or 0),
+    st = bp(tonumber(st) or 0),
+    sh = bp(tonumber(sh) or 0),
+    sto = tonumber(sto) or 0,
+    sho = tonumber(sho) or 0,
+  }
+end
+
+-- The class's \footnoterule, measured for real: the driver typesets it into
+-- box0 and we report its exact vertical recipe (kerns + rules). The page
+-- builder replays these items verbatim — no hardcoded class knowledge.
+function tdom_footrule(boxnum)
+  local box = tex.box[boxnum]
+  if not box then return end
+  local items = extract_items_of(box.list, box)
+  geo_extra['footruleitems'] = items
 end
 
 -- ------------------------------------------------------- galley walking
@@ -196,6 +228,7 @@ local PENALTY = node.id('penalty')
 local DISC = node.id('disc')
 local WHATSIT = node.id('whatsit')
 local INS = node.id('ins')
+local MARK = node.id('mark')
 
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
@@ -251,7 +284,7 @@ local function curcolor()
   return colstack[#colstack] or '#000000'
 end
 
--- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,g='utf8 string', gx={per-glyph x}}
+-- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,g='utf8 string'}
 -- and rules {rule=true,x=,dy=,w=,h=}. dy is relative to the line baseline
 -- (negative = raised). Runs are split at every kern/glue so the browser does
 -- no shaping of its own: positions are TeX's.
@@ -387,23 +420,39 @@ walk_v = function(box, x0, baseline_dy, out)
   end
 end
 
-TDOM_BOXNUM = 254 -- overwritten by the driver right after \newbox\TDOMgalley
 TDOM_FLOATBOX = 253 -- overwritten after \newbox\TDOMfloatbox
 
--- Walk a vertical node list into items (lines with runs, glue, penalties,
--- footnote inserts). Used for the block galley, float boxes and insert
--- contents alike.
+local function is_dummy(n)
+  return n and n.id == HLIST and node.has_attribute(n, DUMMY_ATTR) ~= nil
+end
+
+local function new_dummy()
+  local d = node.new('hlist')
+  d.width = 0
+  d.height = 0
+  d.depth = 0
+  node.set_attribute(d, DUMMY_ATTR, 1)
+  return d
+end
+
+-- Walk a vertical node list into items. Glue carries its FULL specification
+-- (natural/stretch/shrink + orders, subtype) because the orchestrator's page
+-- builder runs TeX's own break-cost arithmetic over these values.
+-- `parentBox` is nil for the top-level MVL harvest (glue there is unset, so
+-- natural width IS the effective width).
 local function extract_items(head, parentBox)
   local items = {}
   local n = head
   while n do
     local id = n.id
-    if id == HLIST or id == VLIST or id == RULE then
+    if is_dummy(n) then
+      -- the page-keeper box: not document content
+    elseif id == HLIST or id == VLIST or id == RULE then
       local h = n.height or 0
       local d = n.depth or 0
       local w = n.width or 0
       if id == RULE then
-        if w < -1073741823 then w = (parentBox and parentBox.width) or 0 end
+        if w < -1073741823 then w = (parentBox and parentBox.width) or tex.dimen.textwidth or 0 end
         if h < -1073741823 then h = 26214 end
         if d < -1073741823 then d = 0 end
       end
@@ -422,13 +471,40 @@ local function extract_items(head, parentBox)
       end
       items[#items + 1] = item
     elseif id == GLUE then
-      items[#items + 1] = { k = 'glue', a = bp(node.effective_glue(n, parentBox) or n.width) }
+      if not parentBox and (n.subtype or 0) == 10 then
+        -- \topskip glue is page-builder machinery, not document content:
+        -- the orchestrator's page builder inserts its own \topskip at real
+        -- page tops. (It can appear here when TeX's dormant builder saw an
+        -- "empty" page, e.g. right after boot or an absorbed output.)
+      else
+        local eff
+        if parentBox then
+          eff = bp(node.effective_glue(n, parentBox) or n.width)
+        else
+          eff = bp(n.width or 0)
+        end
+        local it = { k = 'glue', a = eff, sub = n.subtype or 0 }
+        -- stretch/shrink only matter for the top-level stream (page
+        -- breaking); inside packed boxes the set values are already final
+        if not parentBox then
+          if (n.stretch or 0) ~= 0 then
+            it.st = bp(n.stretch)
+            it.sto = n.stretch_order or 0
+          end
+          if (n.shrink or 0) ~= 0 then
+            it.sh = bp(n.shrink)
+            it.sho = n.shrink_order or 0
+          end
+        end
+        items[#items + 1] = it
+      end
     elseif id == KERN then
       items[#items + 1] = { k = 'kern', a = bp(n.kern or 0) }
     elseif id == PENALTY then
       items[#items + 1] = { k = 'pen', v = n.penalty or 0 }
     elseif id == INS then
-      -- a footnote (or other insert): capture its typeset content
+      -- a footnote (or other insert): capture its typeset content.
+      -- n.height is what TeX subtracts from the page goal.
       local content = n.head or n.list
       local sub = extract_items(content, n)
       local total = 0
@@ -436,9 +512,26 @@ local function extract_items(head, parentBox)
         if it.k == 'box' then total = total + it.h + it.d
         elseif it.k == 'glue' or it.k == 'kern' then total = total + (it.a or 0) end
       end
-      items[#items + 1] = { k = 'ins', class = n.subtype or 0, items = sub, h = total }
+      items[#items + 1] = {
+        k = 'ins',
+        class = n.subtype or 0,
+        items = sub,
+        h = bp(n.height or 0),
+        d = bp(n.depth or 0),
+        hc = total,
+      }
     elseif id == WHATSIT then
-      if not check_special(n) and LIT_SUB and n.subtype == LIT_SUB then
+      if check_special(n) then
+        -- a vertical-mode float anchor: record it as a stream item at its
+        -- exact position (LaTeX considers the float exactly here)
+        for _, fn in ipairs(pending_fmarks) do
+          items[#items + 1] = { k = 'fm', n = fn }
+        end
+        pending_fmarks = {}
+      elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:eject') then
+        local pen = tonumber(n.data:match('^tdom:eject:(-?%d+)')) or -10000
+        items[#items + 1] = { k = 'eject', v = pen }
+      elseif LIT_SUB and n.subtype == LIT_SUB then
         blk_gfx = true
       end
     end
@@ -447,14 +540,100 @@ local function extract_items(head, parentBox)
   return items
 end
 
--- Top level: the galley vbox -> vertical items with per-line runs.
-local function extract_galley()
-  local box = tex.box[TDOM_BOXNUM]
-  if not box then return {}, 0, 0, 0 end
-  colstack = {}
-  pending_fmarks = {}
-  local items = extract_items(box.list, box)
-  return items, bp(box.width or 0), bp(box.height or 0), bp(box.depth or 0)
+-- referenced before definition inside tdom_footrule
+function extract_items_of(head, parentBox)
+  return extract_items(head, parentBox)
+end
+
+-- --------------------------------------------------- MVL harvest core
+
+-- Reseed the dormant page with a fresh dummy box. The dummy keeps the page
+-- non-empty so the page builder never discards leading glue (TeX drops
+-- discardables on an empty page) and never inserts \topskip glue — both are
+-- the orchestrator's job at real page boundaries.
+--
+-- IMPORTANT: the builder's internal page_contents FLAG is not reachable
+-- from Lua; the driver first contributes a real \hbox to0pt{} (which sets
+-- the flag to box_there) and only then calls tdom_seed to swap the list.
+-- The flag survives all later list surgery.
+function tdom_seed()
+  pcall(function() tex.triggerbuildpage() end)
+  local old = tex.lists.page_head
+  local oldc = tex.lists.contrib_head
+  tex.lists.contrib_head = nil
+  tex.lists.page_head = new_dummy()
+  pcall(function() tex.pagetotal = 0 end)
+  pcall(function() tex.pagedepth = 0 end)
+  if old then node.flush_list(old) end
+  if oldc then node.flush_list(oldc) end
+  -- fresh document start: no interline glue above the first line
+  tex.nest[0].prevdepth = -65536000
+end
+
+-- Collect the freshly typeset MVL nodes (page list + any contributions the
+-- page builder has not moved yet), as one continuous node list COPY-FREE.
+local function harvest_nodes()
+  pcall(function() tex.triggerbuildpage() end)
+  local head = tex.lists.page_head
+  local contrib = tex.lists.contrib_head
+  -- detach both lists from TeX first, then splice
+  tex.lists.page_head = new_dummy()
+  tex.lists.contrib_head = nil
+  pcall(function() tex.pagetotal = 0 end)
+  pcall(function() tex.pagedepth = 0 end)
+  if head and contrib then
+    local tail = node.tail(head)
+    tail.next = contrib
+    contrib.prev = tail
+  end
+  return head or contrib
+end
+
+-- Safety net: if something in the document force-ejects a page (\pagebreak,
+-- \clearpage internals, a package's raw \penalty-10000), the output routine
+-- fires. We absorb \box255 back into the dormant page, plant an eject marker
+-- so the orchestrator breaks the page at exactly this point, and continue.
+function tdom_absorb_output()
+  tex.deadcycles = 0
+  local pen = tex.outputpenalty or -10000
+  local b = tex.box[255]
+  local list = nil
+  if b then
+    list = b.list
+    b.list = nil
+    tex.box[255] = nil -- frees the (now empty) box node
+  end
+  local marker = nil
+  if pen > -10002 then
+    -- a genuine eject (\newpage -10000 / \clearpage -10001), not a float
+    -- signal: plant the marker at the break position
+    marker = node.new('whatsit', SPECIAL_SUB)
+    marker.data = 'tdom:eject:' .. pen
+  end
+  local newhead = list
+  if not newhead or not is_dummy(newhead) then
+    local d = new_dummy()
+    d.next = newhead
+    if newhead then newhead.prev = d end
+    newhead = d
+  end
+  if marker then
+    local tail = node.tail(newhead)
+    tail.next = marker
+    marker.prev = tail
+  end
+  -- The output routine left the page truly empty (its internal
+  -- page_contents flag included). Hand the material back through the
+  -- CONTRIBUTION list so the first box (our dummy) restores the flag; the
+  -- \topskip glue the builder puts above the dummy is dropped at harvest.
+  local oldc = tex.lists.contrib_head
+  if oldc then
+    local tail = node.tail(newhead)
+    tail.next = oldc
+    oldc.prev = tail
+  end
+  tex.lists.contrib_head = newhead
+  pcall(function() tex.pagetotal = 0 end)
 end
 
 -- Called from the float environment shims: capture the float box galley.
@@ -464,7 +643,10 @@ function tdom_float(n, placement, ftype)
   colstack = {}
   local saved_gfx = blk_gfx
   blk_gfx = false
+  local saved_marks = pending_fmarks
+  pending_fmarks = {}
   local items = extract_items(box.list, box)
+  pending_fmarks = saved_marks
   local fgfx = blk_gfx
   blk_gfx = saved_gfx
   blk_floats[#blk_floats + 1] = {
@@ -506,7 +688,24 @@ local function encode_runs(items)
 end
 
 function tdom_report()
-  local items, w, h, d = extract_galley()
+  -- cross-block layout state: the next block's leading interline glue and
+  -- \@afterheading behavior depend on these — they join the state vector so
+  -- the orchestrator's convergence check re-typesets downstream blocks
+  -- whenever they move (same mechanism as counters).
+  blk_counters['tdom@pd'] = math.floor(tex.nest[0].prevdepth or 0)
+  local head = harvest_nodes()
+  colstack = {}
+  pending_fmarks = {}
+  local items = extract_items(head, nil)
+  local w, hsum = 0, 0
+  for _, it in ipairs(items) do
+    if it.k == 'box' then
+      if (it.w or 0) > w then w = it.w end
+      hsum = hsum + it.h + it.d
+    elseif it.k == 'glue' or it.k == 'kern' then
+      hsum = hsum + (it.a or 0)
+    end
+  end
   encode_runs(items)
   for _, f in ipairs(blk_floats) do encode_runs(f.items) end
   local fonts = {}
@@ -520,8 +719,8 @@ function tdom_report()
     block = JOB.id,
     gfx = blk_gfx,
     w = w,
-    h = h,
-    d = d,
+    h = hsum,
+    d = 0,
     items = items,
     floats = blk_floats,
     fonts = fonts,
@@ -529,6 +728,7 @@ function tdom_report()
     refs = blk_refs,
     state = blk_counters,
   })
+  if head then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
   -- this child now becomes the next checkpoint in the chain
@@ -539,15 +739,51 @@ end
 
 -- ------------------------------------------------------------ shipping
 
+-- Render child: vpack the harvested MVL nodes (the exact nodes the galley
+-- reported) and ship them as one tight PDF page.
 function tdom_ship()
-  local box = tex.box[TDOM_BOXNUM]
-  if not box then return end
-  local b = node.copy_list(box)
+  local head = harvest_nodes()
+  if not head then return end
+  -- drop the leading dummy and any held ins nodes: footnote bodies are
+  -- placed by the orchestrator's page builder, not inside the block chunk
+  -- (they contribute no vertical space in the item stream either)
+  local out = nil
+  local tail = nil
+  local n = head
+  while n do
+    local nxt = n.next
+    n.next = nil
+    n.prev = nil
+    if is_dummy(n) or n.id == INS then
+      node.free(n)
+    else
+      if tail then
+        tail.next = n
+        n.prev = tail
+      else
+        out = n
+      end
+      tail = n
+    end
+    n = nxt
+  end
+  if not out then return end
+  local b = node.vpack(out)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
   tex.pagewidth = w
   tex.pageheight = total
+end
+
+-- Render child epilogue: leave the dormant page truly empty so the \end
+-- primitive can finalize the PDF without exercising the output routine.
+function tdom_render_end()
+  local old = tex.lists.page_head
+  tex.lists.page_head = nil
+  tex.lists.contrib_head = nil
+  pcall(function() tex.pagetotal = 0 end)
+  if old then node.flush_list(old) end
 end
 
 -- Render children: after the main galley page, ship one tight page per
@@ -586,15 +822,14 @@ function tdom_wait()
     elseif cmd == 'PING' then
       conn:send('PONG ' .. CKPT .. '\n')
     elseif cmd == 'JOB' then
-      -- JOB <blockId> <newCkptIdx> <noindentFlag>:<bodyLen>
+      -- JOB <blockId> <newCkptIdx> <bodyLen>
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
-      local noind, len = c:match('^(%d):(%d+)$')
-      len = tonumber(len) or 0
+      local len = tonumber(c) or 0
       local body = len > 0 and conn:receive(len) or ''
       local pid = fk.fork()
       if pid == 0 then
-        JOB = { id = id, ckpt = newckpt, body = body, noindent = noind == '1' }
+        JOB = { id = id, ckpt = newckpt, body = body }
         blk_labels = {}
         blk_refs = {}
         blk_counters = {}
@@ -643,23 +878,28 @@ function tdom_wait()
 end
 
 function inject_job(body, ship)
+  -- Typeset ON the main vertical list — full state continuity with the
+  -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
+  -- The dormant page collects the nodes; tdom_report harvests them.
   local lines = {}
-  lines[#lines + 1] = '\\global\\setbox\\TDOMgalley=\\vbox{\\hsize=\\textwidth'
-  if JOB and JOB.noindent then lines[#lines + 1] = '\\noindent' end
   for l in (body .. '\n'):gmatch('(.-)\n') do
     lines[#lines + 1] = l
   end
-  lines[#lines + 1] = '\\par}'
+  lines[#lines + 1] = '\\par'
   if ship then
     lines[#lines + 1] = '\\directlua{tdom_ship()}'
     lines[#lines + 1] = '\\shipout\\box255'
     lines[#lines + 1] = '\\directlua{tdom_ship_floats()}'
+    lines[#lines + 1] = '\\directlua{tdom_render_end()}'
     lines[#lines + 1] = '\\csname @@end\\endcsname'
   else
     for _, name in ipairs(COUNTERS) do
       lines[#lines + 1] = '\\ifcsname c@' .. name .. '\\endcsname\\directlua{tdom_counter(\'' ..
         name .. '\',\\number\\value{' .. name .. '})}\\fi'
     end
+    -- \if@nobreak (post-heading state) is part of the exit state vector
+    lines[#lines + 1] = '\\csname if@nobreak\\endcsname\\directlua{tdom_counter(\'tdom@nobreak\',1)}' ..
+      '\\else\\directlua{tdom_counter(\'tdom@nobreak\',0)}\\fi'
     lines[#lines + 1] = '\\directlua{tdom_report()}'
   end
   tex.print(lines)
