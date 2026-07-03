@@ -10,9 +10,13 @@
 //     real LuaTeX) composed with clip windows + a folio number
 
 const editor = document.getElementById('editor');
+const editorHighlightEl = document.getElementById('editor-highlight');
 const pagesEl = document.getElementById('pages');
 const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
+const menuToggleButton = document.getElementById('menu-toggle');
+const layoutViewEl = document.getElementById('layout-view');
+const splitRangeEl = document.getElementById('split-range');
 const outlineEl = document.getElementById('doc-outline');
 const visualEditorEl = document.getElementById('visual-editor');
 const wordEditorEl = document.getElementById('word-editor');
@@ -74,7 +78,7 @@ const aiDraftButton = document.getElementById('ai-draft');
 const aiInsertButton = document.getElementById('ai-insert');
 const aiResultEl = document.getElementById('ai-result');
 const aiDialogEl = document.getElementById('ai-dialog');
-const aiPdfPreviewEl = document.getElementById('ai-pdf-preview');
+const aiPreviewStageEl = document.getElementById('ai-preview-stage');
 const aiLaneInputs = [...document.querySelectorAll('input[name="ai-lane"]')];
 const aiModeLabels = [...document.querySelectorAll('[data-ai-scope]')];
 const tableRowsEl = document.getElementById('table-rows');
@@ -149,6 +153,41 @@ let tableData = [
   ['Gamma', '3.0', ''],
 ];
 const tableMerges = new Map();
+
+function applyLayoutView(value = layoutViewEl?.value || 'both') {
+  document.body.dataset.layoutView = value;
+}
+
+function applySplitRatio(value = splitRangeEl?.value || 48) {
+  const workspace = Math.max(35, Math.min(70, Number(value) || 48));
+  document.documentElement.style.setProperty('--workspace-fr', `${workspace}fr`);
+  document.documentElement.style.setProperty('--preview-fr', `${100 - workspace}fr`);
+}
+
+function setMenuCollapsed(collapsed) {
+  document.body.classList.toggle('menu-collapsed', collapsed);
+  if (menuToggleButton) {
+    menuToggleButton.textContent = collapsed ? 'Menu +' : 'Menu';
+    menuToggleButton.title = collapsed ? 'メニューバーを開く' : 'メニューバーを閉じる';
+  }
+}
+
+function highlightTexSource(source) {
+  if (!editorHighlightEl) return;
+  const html = escapeHtml(source || '')
+    .replace(/(%[^\n]*)/g, '<span class="tok-comment">$1</span>')
+    .replace(/(\\(?:[A-Za-z@]+|.))/g, '<span class="tok-command">$1</span>')
+    .replace(/(\{[^{}\n]*\})/g, '<span class="tok-brace">$1</span>')
+    .replace(/(\$[^$\n]*\$)/g, '<span class="tok-math">$1</span>');
+  editorHighlightEl.innerHTML = html + (source.endsWith('\n') ? '\n' : '');
+}
+
+function syncEditorHighlight() {
+  if (!editor || !editorHighlightEl) return;
+  highlightTexSource(editor.value);
+  editorHighlightEl.scrollTop = editor.scrollTop;
+  editorHighlightEl.scrollLeft = editor.scrollLeft;
+}
 let selectedTableCell = { row: 0, col: 0 };
 let drawMode = '2d';
 let drawTool = 'line';
@@ -224,6 +263,7 @@ function adoptDoc(doc) {
   injectFonts(doc.fonts);
   serverText = doc.source;
   editor.value = doc.source;
+  syncEditorHighlight();
   pagesEl.textContent = '';
   pageDivs.clear();
   for (const dl of doc.pages) renderPage(dl, false);
@@ -1528,6 +1568,7 @@ function diffText(oldStr, newStr) {
 }
 
 function scheduleSync() {
+  syncEditorHighlight();
   if (backend === 'lualatex') {
     // per-block compiles cost ~0.5s: coalesce keystrokes
     clearTimeout(debounceTimer);
@@ -1582,11 +1623,14 @@ function flushSync() {
 editor.addEventListener('compositionstart', () => (composing = true));
 editor.addEventListener('compositionend', () => {
   composing = false;
+  syncEditorHighlight();
   scheduleSync();
 });
 editor.addEventListener('input', () => {
+  syncEditorHighlight();
   if (!composing) scheduleSync();
 });
+editor.addEventListener('scroll', syncEditorHighlight);
 
 // Preview interactions:
 //   click     -> PowerPoint-style box editing right on the page
@@ -1675,6 +1719,13 @@ document.getElementById('mode-nav')?.addEventListener('click', (ev) => {
   if (!button) return;
   setWorkspaceMode(button.dataset.workspace);
 });
+
+layoutViewEl?.addEventListener('change', () => applyLayoutView(layoutViewEl.value));
+splitRangeEl?.addEventListener('input', () => applySplitRatio(splitRangeEl.value));
+menuToggleButton?.addEventListener('click', () => setMenuCollapsed(!document.body.classList.contains('menu-collapsed')));
+applyLayoutView();
+applySplitRatio();
+setMenuCollapsed(false);
 
 // ---------------------------------------------------------------- AI assist
 
@@ -1829,25 +1880,27 @@ function renderAiDraft(draft) {
 }
 
 function renderAiPdfPreview(state) {
-  if (!aiPdfPreviewEl) return;
+  if (!aiPreviewStageEl) return;
   if (!state) {
-    aiPdfPreviewEl.className = 'ai-pdf-preview is-hidden';
-    aiPdfPreviewEl.innerHTML = '';
+    aiPreviewStageEl.className = 'ai-preview-stage is-hidden';
+    aiPreviewStageEl.innerHTML = '';
+    pagesEl?.classList.remove('is-backgrounded');
     return;
   }
-  aiPdfPreviewEl.className = `ai-pdf-preview ${state.error ? 'has-error' : ''}`;
+  aiPreviewStageEl.className = `ai-preview-stage ${state.error ? 'has-error' : ''}`;
+  pagesEl?.classList.add('is-backgrounded');
   if (state.loading) {
-    aiPdfPreviewEl.innerHTML = '<div class="ai-preview-status">LuaLaTeXでPDFプレビューを作成中…</div>';
+    aiPreviewStageEl.innerHTML = '<div class="ai-preview-status">LuaLaTeXでPDFプレビューを作成中…</div>';
     return;
   }
   if (state.error) {
-    aiPdfPreviewEl.innerHTML = `
+    aiPreviewStageEl.innerHTML = `
       <div class="ai-preview-status">PDFプレビューを作成できませんでした</div>
       <pre>${escapeHtml(state.error)}</pre>
     `;
     return;
   }
-  aiPdfPreviewEl.innerHTML = `
+  aiPreviewStageEl.innerHTML = `
     <div class="ai-preview-status">実コンパイルPDFプレビュー</div>
     <iframe title="AI style PDF preview" src="${escapeHtml(state.url)}"></iframe>
   `;
@@ -4772,8 +4825,8 @@ function placePreviewInsertButton(pageDiv, src, rect) {
   previewInsertButton.dataset.targetSrc = src;
   Object.assign(previewInsertButton.style, {
     display: 'grid',
-    left: Math.min(96, Math.max(2, rect.left + rect.width + 0.6)) + '%',
-    top: Math.min(96, Math.max(2, rect.top + rect.height - 1.5)) + '%',
+    left: Math.min(98, Math.max(2, rect.left + rect.width)) + '%',
+    top: Math.min(98, Math.max(2, rect.top + rect.height)) + '%',
   });
 }
 
@@ -6127,6 +6180,7 @@ sse.onmessage = (ev) => {
           if (doc.report.rev === appliedRev && editor.value !== doc.source && document.activeElement !== editor) {
             serverText = doc.source;
             editor.value = doc.source;
+            syncEditorHighlight();
           }
         });
     } else if (msg.kind === 'reset') {

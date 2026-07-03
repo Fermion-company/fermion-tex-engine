@@ -16,6 +16,16 @@
   </div>
   <div class="status" id="status">起動中…</div>
   <div class="actions">
+    <button id="menu-toggle" title="メニューバーを閉じる">Menu</button>
+    <select id="layout-view" title="表示するペイン">
+      <option value="both" selected>両方表示</option>
+      <option value="workspace">ワークスペースのみ</option>
+      <option value="preview">プレビューのみ</option>
+    </select>
+    <label class="split-control" title="ワークスペースとプレビューの比率">
+      <span>Split</span>
+      <input id="split-range" type="range" min="35" max="70" value="48">
+    </label>
     <select id="tpl-select" title="テンプレートから新規作成">
       <option value="">テンプレート…</option>
     </select>
@@ -483,7 +493,6 @@
           <button id="ai-draft" type="button">候補を作成</button>
           <button id="ai-insert" type="button" disabled>文書に追加</button>
         </div>
-        <div id="ai-pdf-preview" class="ai-pdf-preview is-hidden" aria-live="polite"></div>
         <div id="ai-result" class="ai-result ai-draft-card" aria-live="polite"></div>
       </div>
     </div>
@@ -498,7 +507,17 @@
           <input id="code-file-input" class="visually-hidden" type="file" accept=".tex,.sty,.cls,.bib,text/plain">
           <div id="code-file-list" class="code-file-list" aria-live="polite"></div>
         </aside>
-        <div class="code-main">
+        <section class="code-editor-pane">
+          <div class="code-editor-head">
+            <span>main.tex</span>
+            <span>LuaLaTeX</span>
+          </div>
+          <div class="code-editor-shell">
+            <pre id="editor-highlight" aria-hidden="true"></pre>
+            <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
+          </div>
+        </section>
+        <aside class="code-preview-pane">
           <section class="code-detail">
             <div class="code-detail-head">
               <h3>ファイルを組み込む</h3>
@@ -556,9 +575,8 @@
             <textarea id="code-split-body" spellcheck="true" placeholder="分割ファイルに入れる本文。空なら見出しだけ作成します。"></textarea>
             <button id="code-split-create" class="primary-action" type="button">分割ファイルを作成して参照を追加</button>
           </section>
-        </div>
+        </aside>
       </div>
-      <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
     </div>
   </section>
 
@@ -571,6 +589,7 @@
         <button id="zoom-fit" title="幅に合わせる">合わせる</button>
       </span>
     </div>
+    <div id="ai-preview-stage" class="ai-preview-stage is-hidden" aria-live="polite"></div>
     <div id="pages"></div>
   </section>
 
