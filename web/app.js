@@ -342,7 +342,7 @@ pagesEl.addEventListener(
     ev.preventDefault();
     let dy = ev.deltaY;
     if (ev.deltaMode === 1) dy *= 16; // line mode -> approx pixels
-    const factor = Math.min(1.2, Math.max(1 / 1.2, Math.exp(-dy * 0.0022)));
+    const factor = Math.min(1.25, Math.max(1 / 1.25, Math.exp(-dy * 0.0035)));
     setZoom(zoom * factor);
   },
   { passive: false }
