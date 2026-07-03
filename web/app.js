@@ -138,6 +138,7 @@ let customizeDirty = false;
 let aiDraft = null;
 let aiLastPrompt = '';
 let uploadedTexFiles = [];
+let selectedCodeFile = null;
 let tableData = [
   ['項目', '値', '備考'],
   ['Alpha', '1.0', ''],
@@ -615,7 +616,7 @@ function renderCodeFileTree(items) {
         <div class="code-folder-name">${escapeHtml(folder)}</div>
         ${files
           .map((item) => `
-            <button class="code-file-item ${item.uploaded ? 'is-uploaded' : ''}" type="button" data-code-file-path="${escapeHtml(item.path)}">
+            <button class="code-file-item ${item.uploaded ? 'is-uploaded' : ''} ${selectedCodeFile?.path === item.path ? 'is-selected' : ''}" type="button" data-code-file-path="${escapeHtml(item.path)}" data-code-file-kind="${escapeHtml(item.fileKind || '')}" data-code-file-uploaded="${item.uploaded ? 'true' : 'false'}">
               <span class="code-file-icon">${escapeHtml(codeFileIcon(item.kind, item.path))}</span>
               <span class="code-file-path">${escapeHtml(item.path.split('/').pop() || item.path)}</span>
               <span class="code-file-command">${escapeHtml(item.command)}</span>
@@ -636,8 +637,8 @@ function renderCodeFileList(source) {
     return;
   }
   const items = [
-    ...current.map((item) => ({ ...item, uploaded: false })),
-    ...uploaded.map((file) => ({ kind: '保存済み', path: file.texPath, command: '未参照', uploaded: true })),
+    ...current.map((item) => ({ ...item, uploaded: false, fileKind: texFileKind(item.path, 'auto') })),
+    ...uploaded.map((file) => ({ kind: '保存済み', path: file.texPath, command: '未参照', uploaded: true, fileKind: texFileKind(file.texPath, 'auto') })),
   ];
   codeFileListEl.innerHTML = renderCodeFileTree(items);
 }
@@ -2721,22 +2722,40 @@ function integrateTexFileIntoSource(source, saved, kind, target = 'end') {
   return source;
 }
 
+function uploadedTexFileByPath(texPath) {
+  return uploadedTexFiles.find((file) => file.texPath === texPath || file.packageName === texPath) || null;
+}
+
+function setSelectedCodeFile(selection) {
+  selectedCodeFile = selection;
+  if (codePickedFileEl) {
+    codePickedFileEl.textContent = selection?.path || codeFileInputEl?.files?.[0]?.name || '未選択';
+  }
+  renderCodeFileList(editor.value);
+}
+
 async function integrateSelectedCodeFile() {
   const file = codeFileInputEl?.files?.[0];
+  const selectedUploaded = selectedCodeFile?.uploaded ? uploadedTexFileByPath(selectedCodeFile.path) : null;
   if (!file) {
-    statusEl.textContent = '組み込む TeX 系ファイルを選択してください';
-    return;
+    if (!selectedUploaded) {
+      statusEl.textContent = '組み込む TeX 系ファイルを選択してください';
+      return;
+    }
   }
   codeFileIntegrateButton.disabled = true;
   try {
-    const kind = texFileKind(file.name, codeFileKindEl?.value || 'auto');
-    const saved = await uploadTexFile(file.name, await readTextFile(file));
+    const kind = texFileKind(file?.name || selectedUploaded.texPath, codeFileKindEl?.value || selectedCodeFile?.kind || 'auto');
+    const saved = file ? await uploadTexFile(file.name, await readTextFile(file)) : selectedUploaded;
     editor.value = integrateTexFileIntoSource(editor.value, saved, kind, codeFileTargetEl?.value || 'end');
     scheduleSync();
     statusEl.textContent =
       kind === 'cls'
         ? `${saved.texPath} を保存しました。文書クラスの切り替えはカスタマイズで行います`
         : `${saved.texPath} を文書に組み込みました`;
+    selectedCodeFile = null;
+    if (codeFileInputEl) codeFileInputEl.value = '';
+    if (codePickedFileEl) codePickedFileEl.textContent = '未選択';
     renderCodeFileList(editor.value);
   } catch (err) {
     statusEl.textContent = `ファイル組み込みエラー: ${err.message}`;
@@ -2774,12 +2793,17 @@ codeSplitCreateButton?.addEventListener('click', createSplitTexFile);
 codeFilePickButton?.addEventListener('click', () => codeFileInputEl?.click());
 codeFileInputEl?.addEventListener('change', () => {
   const file = codeFileInputEl.files?.[0];
+  selectedCodeFile = null;
   if (codePickedFileEl) codePickedFileEl.textContent = file ? file.name : '未選択';
+  renderCodeFileList(editor.value);
 });
 codeFileListEl?.addEventListener('click', (ev) => {
   const item = ev.target.closest?.('[data-code-file-path]');
   if (!item || !codePickedFileEl) return;
-  codePickedFileEl.textContent = item.dataset.codeFilePath || '未選択';
+  const path = item.dataset.codeFilePath || '';
+  const uploaded = item.dataset.codeFileUploaded === 'true';
+  setSelectedCodeFile({ path, uploaded, kind: item.dataset.codeFileKind || 'auto' });
+  if (uploaded && codeFileInputEl) codeFileInputEl.value = '';
 });
 
 async function insertImageFigure() {

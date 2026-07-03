@@ -1183,6 +1183,10 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .code-file-item:hover {
   background: #eef6ff;
 }
+.code-file-item.is-selected {
+  background: #e9f7ff;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .code-file-item.is-uploaded {
   color: #475569;
 }
