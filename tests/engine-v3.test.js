@@ -83,7 +83,7 @@ test('TikZ blocks are flagged for the exact-render tier and get chunks', opts, a
   const gfx = dom.blocks.filter((b) => b.gfx);
   assert.ok(gfx.length >= 1, 'tikz block detected via pdf literals');
   // wait for the async exact render to land
-  const id = gfx[0].id;
+  const id = gfx[0].gfxChunks?.[0] ?? gfx[0].id;
   for (let i = 0; i < 100 && !eng.getChunkSVG(id); i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
