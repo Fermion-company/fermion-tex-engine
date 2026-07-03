@@ -921,13 +921,13 @@ export class CheckpointEngine {
     if (this.rendering.has(inflightKey)) return;
     this.rendering.add(inflightKey);
     try {
-      // entry counters = fold of state deltas over the preceding chain
-      const entry = Object.fromEntries(this.counters.map((c) => [c, 0]));
-      for (let j = 0; j < idx; j++) {
-        for (const [k, v] of Object.entries(this.blocks[j].stateDelta ?? {})) {
-          entry[k] = (entry[k] ?? 0) + v;
-        }
-      }
+      // entry counters = the previous block's REAL exit vector (captured
+      // from TeX by the galley report); zeros at the document start
+      const entry = {};
+      const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
+      this.counters.forEach((c, i) => {
+        entry[c] = prevVec[i] ?? 0;
+      });
       const text = this.store.get(this.file);
       const bounds = documentBounds(text);
       const L = [];
