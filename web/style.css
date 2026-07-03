@@ -60,7 +60,7 @@ body {
 .brand .name { font-weight: 700; font-size: 13px; }
 
 .status {
-  flex: 1 1 96px;
+  flex: 1 1 auto;
   min-width: 0;
   font-variant-numeric: tabular-nums;
   color: var(--accent);
@@ -101,6 +101,7 @@ body {
 .topbar-menu-toggle {
   flex: 0 0 auto;
   width: 26px;
+  margin-left: auto;
   padding-inline: 0;
   cursor: pointer;
   white-space: nowrap;
@@ -1356,13 +1357,20 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   font: 11px/1.2 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
 }
 .code-sidebar-head button {
-  width: 26px;
+  min-width: 74px;
   height: 26px;
+  padding: 0 8px;
   border: 1px solid #cfd8e8;
   border-radius: 6px;
   background: #fff;
   color: #253047;
   cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.code-sidebar-head button:hover {
+  border-color: #5cc8ff;
+  color: #0369a1;
 }
 .code-file-list {
   min-height: 0;

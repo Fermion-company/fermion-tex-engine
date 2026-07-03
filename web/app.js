@@ -827,7 +827,7 @@ function renderCodeFileList(source) {
   const current = collectExternalFiles(source);
   const uploaded = uploadedTexFiles.filter((file) => !current.some((item) => item.path === file.texPath || item.path === file.packageName));
   if (!current.length && !uploaded.length) {
-    codeFileListEl.innerHTML = '<div class="empty-state">外部ファイル参照はまだありません</div>';
+    codeFileListEl.innerHTML = '<div class="empty-state">＋ ファイル から .tex/.sty/.cls/.bib を追加できます</div>';
     return;
   }
   const items = [
@@ -1863,6 +1863,13 @@ function setWorkspaceMode(mode) {
   document.querySelectorAll('.workspace-panel').forEach((panel) => {
     panel.classList.toggle('is-active', panel.dataset.panel === mode);
   });
+  if (mode === 'code') {
+    renderCodeFileList(editor.value);
+    if (!pendingCodeFile && !selectedCodeFile) {
+      renderCodeFilePreview('', '');
+      if (codePickedFileEl) codePickedFileEl.textContent = '未選択';
+    }
+  }
 }
 
 document.getElementById('mode-nav')?.addEventListener('click', (ev) => {
