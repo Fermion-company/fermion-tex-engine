@@ -291,6 +291,26 @@ end
 
 local walk_h, walk_v
 
+local function leader_rule(n)
+  if node.getleader then
+    return node.getleader(n)
+  end
+  return n.leader
+end
+
+local function emit_leader_rule(n, parent, x, dy0, out)
+  local lead = leader_rule(n)
+  if not lead or lead.id ~= RULE then return false end
+  local w = node.effective_glue(n, parent) or n.width or 0
+  if w <= 0 then return false end
+  local h = lead.height or 0
+  local d = lead.depth or 0
+  if h < -1073741823 then h = 26214 end
+  if d < -1073741823 then d = 0 end
+  out[#out + 1] = { rule = true, x = x, dy = dy0 - bp(h), w = bp(w), h = bp(h) + bp(d), c = curcolor() }
+  return true
+end
+
 walk_h = function(head, parent, x0, dy0, out)
   local x = x0
   local run = nil
@@ -336,6 +356,7 @@ walk_h = function(head, parent, x0, dy0, out)
       x = x + bp(n.kern or 0)
     elseif id == GLUE then
       flush()
+      emit_leader_rule(n, parent, x, dy0, out)
       x = x + bp(node.effective_glue(n, parent) or 0)
     elseif id == HLIST then
       flush()

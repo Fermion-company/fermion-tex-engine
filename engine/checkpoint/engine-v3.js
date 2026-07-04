@@ -156,24 +156,29 @@ export class CheckpointEngine {
       backend: this.backendName,
       pageCount: this.pages.length,
       checkpoints: [...this.checkpoints.keys()].sort((a, b) => a - b),
-      blocks: this.blocks.map((b, i) => ({
-        id: b.id,
-        index: i,
-        type: b.kind ?? 'block',
-        gfx: !!b.gfx,
-        source: {
-          file: this.file,
-          start: this.store.position(this.file, b.start),
-          end: this.store.position(this.file, b.end),
-        },
-        labels: (b.galley?.labels ?? []).map((l) => l.k),
-        refs: b.galley?.refs ?? [],
-        pages: blockPages.get(b.id) ?? [],
-        // raw offsets into the main buffer for in-preview box editing;
-        // blocks expanded from \input files are not editable in-place
-        file: b.file ?? null,
-        span: b.file ? null : { start: b.start, end: b.end },
-      })),
+      blocks: this.blocks.map((b, i) => {
+        const floatGfxChunks = (b.galley?.floats ?? []).filter((f) => f.gfx).map((f) => `${b.id}#${f.n}`);
+        const gfxChunks = [...(b.gfx ? [b.id] : []), ...floatGfxChunks];
+        return {
+          id: b.id,
+          index: i,
+          type: b.kind ?? 'block',
+          gfx: gfxChunks.length > 0,
+          gfxChunks,
+          source: {
+            file: this.file,
+            start: this.store.position(this.file, b.start),
+            end: this.store.position(this.file, b.end),
+          },
+          labels: (b.galley?.labels ?? []).map((l) => l.k),
+          refs: b.galley?.refs ?? [],
+          pages: blockPages.get(b.id) ?? [],
+          // raw offsets into the main buffer for in-preview box editing;
+          // blocks expanded from \input files are not editable in-place
+          file: b.file ?? null,
+          span: b.file ? null : { start: b.start, end: b.end },
+        };
+      }),
       labels: Object.fromEntries(this.labelTable),
     };
   }

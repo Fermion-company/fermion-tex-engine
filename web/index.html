@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fermion TeX Engine — TeX DOM Runtime</title>
+<title>Fermion TeX Engine</title>
+<link rel="stylesheet" href="/mathlive/mathlive-static.css">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -11,23 +12,573 @@
   <div class="brand">
     <span class="logo">Ψ</span>
     <span class="name">Fermion TeX Engine</span>
-    <span class="sub">TeX DOM Runtime — resident incremental typesetting</span>
   </div>
-  <div class="status" id="status">起動中…</div>
+  <div class="status" id="status"></div>
+  <button id="menu-toggle" class="topbar-menu-toggle" title="メニューバーを閉じる" aria-label="メニューバーを閉じる">☰</button>
   <div class="actions">
-    <select id="tpl-select" title="テンプレートから新規作成">
-      <option value="">テンプレート…</option>
+    <select id="layout-view" title="表示するペイン">
+      <option value="both" selected>両方表示</option>
+      <option value="workspace">ワークスペースのみ</option>
+      <option value="preview">プレビューのみ</option>
     </select>
-    <button id="btn-pdf" title="Display List から PDF を生成">PDF 書き出し</button>
+    <select id="tpl-select" title="テンプレートから新規作成">
+      <option value="">テンプレート</option>
+    </select>
+    <button id="btn-pdf" title="Display List から PDF を生成">PDF</button>
     <button id="btn-reset" title="サンプル文書に戻す">リセット</button>
   </div>
 </header>
 
 <main id="layout">
   <section id="editor-pane">
-    <div class="pane-title">main.tex <span class="hint">編集すると差分だけが再組版されます（プレビューをクリック→その場で編集 / Alt+クリック→ソースへ移動）</span></div>
-    <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
+    <div class="pane-title">Menu</div>
+    <nav id="mode-nav" aria-label="作業画面">
+      <button class="mode-btn is-active" type="button" data-workspace="edit">編集</button>
+      <button class="mode-btn" type="button" data-workspace="insert">追加</button>
+      <button class="mode-btn" type="button" data-workspace="structure">構成</button>
+      <button class="mode-btn" type="button" data-workspace="refs">参照</button>
+      <button class="mode-btn" type="button" data-workspace="draw">作図</button>
+      <button class="mode-btn" type="button" data-workspace="table">表</button>
+      <button class="mode-btn" type="button" data-workspace="customize">設定</button>
+      <button class="mode-btn" type="button" data-workspace="ai">AI</button>
+      <button class="mode-btn" type="button" data-workspace="code">コード</button>
+    </nav>
+    <div id="doc-outline"></div>
   </section>
+
+  <section id="workspace-pane">
+    <div class="pane-title">Workspace <span class="hint">TeXを隠した用途別編集</span></div>
+    <div class="workspace-panel is-active" data-panel="edit">
+      <div class="workspace-head">
+        <h2>編集</h2>
+        <span id="doc-summary"></span>
+      </div>
+      <div id="word-editor" class="word-editor">
+        <div class="word-toolbar" role="toolbar" aria-label="書式">
+          <button type="button" data-word-format="bold" title="太字">B</button>
+          <button type="button" data-word-format="italic" title="斜体">I</button>
+          <button type="button" data-word-format="underline" title="下線">U</button>
+          <button type="button" data-word-format="smallcaps" title="小型大文字">SC</button>
+          <button type="button" data-word-format="superscript" title="上付き">x²</button>
+          <button type="button" data-word-format="color-blue" title="青文字">Blue</button>
+          <button type="button" data-word-format="code" title="インラインコード">Code</button>
+          <button type="button" data-word-format="footnote" title="脚注">Note</button>
+          <button type="button" data-word-format="link" title="リンク">Link</button>
+          <button type="button" data-word-format="itemize" title="箇条書き">• List</button>
+          <button type="button" data-word-format="enumerate" title="番号付きリスト">1. List</button>
+          <button type="button" data-word-format="description" title="説明リスト">Desc</button>
+          <button type="button" data-word-format="quote" title="引用">Quote</button>
+          <button type="button" data-word-format="center" title="中央揃え">Center</button>
+          <button type="button" data-word-format="flushleft" title="左揃え">Left</button>
+          <button type="button" data-word-format="flushright" title="右揃え">Right</button>
+        </div>
+        <div id="word-editor-body" class="word-editor-body">
+          <div class="empty-state">左のカードを選ぶと、ここでTeXを見ずに編集できます</div>
+        </div>
+      </div>
+      <div id="visual-editor"></div>
+    </div>
+    <div class="workspace-panel" data-panel="insert">
+      <div class="workspace-head"><h2>追加</h2></div>
+      <div class="insert-builder">
+        <section class="insert-card">
+          <h3>編集領域を作成</h3>
+          <div class="insert-grid">
+            <label>種類
+              <select id="region-type">
+                <option value="paragraph" selected>本文</option>
+                <option value="section">節</option>
+                <option value="subsection">小節</option>
+                <option value="equation">数式</option>
+                <option value="align">整列数式</option>
+                <option value="itemize">箇条書き</option>
+                <option value="enumerate">番号付きリスト</option>
+                <option value="description">説明リスト</option>
+                <option value="quote">引用</option>
+                <option value="center">中央揃え</option>
+                <option value="flushleft">左揃え</option>
+                <option value="flushright">右揃え</option>
+                <option value="theorem">定理</option>
+                <option value="lemma">補題</option>
+                <option value="definition">定義</option>
+                <option value="proof">証明</option>
+              </select>
+            </label>
+            <label>追加位置
+              <select id="region-target">
+                <option value="end" selected>文末</option>
+              </select>
+            </label>
+            <label>タイトル
+              <input id="region-title" type="text" placeholder="見出し・数式名">
+            </label>
+            <label>ラベル
+              <input id="region-label" type="text" placeholder="sec:sample / eq:sample">
+            </label>
+          </div>
+          <textarea id="region-body" placeholder="追加したい本文または数式を入力" spellcheck="true"></textarea>
+          <button id="region-insert" class="primary-action" type="button">編集領域を追加</button>
+        </section>
+        <section class="insert-card">
+          <h3>コードを貼り付け</h3>
+          <div class="insert-grid">
+            <label>名前
+              <input id="code-title" type="text" value="Source code">
+            </label>
+            <label>追加位置
+              <select id="code-target">
+                <option value="end" selected>文末</option>
+              </select>
+            </label>
+            <label class="inline-check"><input id="code-lines" type="checkbox" checked> 行番号</label>
+          </div>
+          <textarea id="code-body" spellcheck="false" placeholder="ここにソースコードを貼り付け"></textarea>
+          <button id="code-insert" class="primary-action" type="button">kkluaverbで追加</button>
+        </section>
+        <section class="insert-card">
+          <h3>画像を図として追加</h3>
+          <div class="insert-grid">
+            <label>画像ファイル
+              <input id="image-file" type="file" accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf">
+            </label>
+            <label>追加位置
+              <select id="image-target">
+                <option value="end" selected>文末</option>
+              </select>
+            </label>
+            <label>幅
+              <input id="image-width" type="text" value="0.8\\linewidth">
+            </label>
+            <label>キャプション
+              <input id="image-caption" type="text" value="追加した画像">
+            </label>
+          </div>
+          <button id="image-insert" class="primary-action" type="button">figureとして追加</button>
+        </section>
+      </div>
+    </div>
+    <div class="workspace-panel" data-panel="structure">
+      <div class="workspace-head"><h2>構成</h2></div>
+      <div id="structure-view"></div>
+    </div>
+    <div class="workspace-panel" data-panel="refs">
+      <div class="workspace-head"><h2>参照管理</h2></div>
+      <div id="ref-editor" class="ref-editor">
+        <div class="ref-controls">
+          <label>対象ラベル
+            <select id="ref-label-select"></select>
+          </label>
+          <label>新しいラベル名
+            <input id="ref-label-name" type="text" placeholder="sec:new-label">
+          </label>
+          <button id="ref-rename" type="button">ラベルを改名</button>
+        </div>
+        <div class="ref-controls">
+          <label>一覧の種類
+            <select id="ref-list-command">
+              <option value="tableofcontents">目次</option>
+              <option value="listoffigures">図一覧</option>
+              <option value="listoftables">表一覧</option>
+            </select>
+          </label>
+          <label>挿入先
+            <select id="ref-list-target">
+              <option value="end" selected>文末</option>
+            </select>
+          </label>
+          <button id="ref-list-insert" type="button">一覧を挿入</button>
+        </div>
+        <div class="ref-controls">
+          <label>参照形式
+            <select id="ref-command">
+              <option value="ref">ref</option>
+              <option value="eqref">eqref</option>
+              <option value="pageref">pageref</option>
+            </select>
+          </label>
+          <label>挿入先
+            <select id="ref-target">
+              <option value="end" selected>文末</option>
+            </select>
+          </label>
+          <button id="ref-insert" type="button">参照を挿入</button>
+        </div>
+        <div class="ref-controls">
+          <label>引用キー
+            <select id="cite-key-select"></select>
+          </label>
+          <label>挿入先
+            <select id="cite-target">
+              <option value="end" selected>文末</option>
+            </select>
+          </label>
+          <button id="cite-insert" type="button">引用を挿入</button>
+        </div>
+        <div class="ref-controls ref-controls-wide">
+          <label>文献キー
+            <input id="bib-key" type="text" placeholder="knuth84">
+          </label>
+          <label>文献情報
+            <input id="bib-text" type="text" placeholder="著者. タイトル. 出版情報, 年.">
+          </label>
+          <button id="bib-add" type="button">文献を追加</button>
+          <button id="bib-update" type="button">選択文献を更新</button>
+        </div>
+      </div>
+      <div id="refs-view"></div>
+    </div>
+    <div class="workspace-panel" data-panel="draw">
+      <div class="workspace-head"><h2>作図</h2></div>
+      <div class="tool-surface">
+        <div class="draw-mode-row" role="group" aria-label="作図モード">
+          <button class="draw-mode is-active" type="button" data-draw-mode="2d">2D図形</button>
+          <button class="draw-mode" type="button" data-draw-mode="3d">3D図形</button>
+          <button class="draw-mode" type="button" data-draw-mode="graph">グラフ</button>
+        </div>
+        <div id="draw-palette" class="draw-palette"></div>
+        <div class="draw-settings">
+          <label><input id="draw-snap" type="checkbox" checked> スナップ</label>
+          <label>グリッド
+            <input id="draw-grid-size" type="number" min="5" max="80" step="5" value="20">
+          </label>
+        </div>
+        <div id="draw-stage" class="draw-stage" aria-label="作図キャンバス">
+          <svg id="draw-svg" viewBox="0 0 360 240" role="img" aria-label="作成中の図"></svg>
+        </div>
+        <div class="tool-row draw-command-row">
+          <button id="draw-add" type="button">選択中の機能を追加</button>
+          <button id="draw-undo" type="button">戻す</button>
+          <button id="draw-redo" type="button">進む</button>
+          <button id="draw-duplicate" type="button">複製</button>
+          <button id="draw-back" type="button">背面へ</button>
+          <button id="draw-front" type="button">前面へ</button>
+          <button id="draw-delete" type="button">削除</button>
+          <button id="draw-clear" type="button">クリア</button>
+        </div>
+        <div id="draw-items" class="draw-items"></div>
+        <div id="draw-props" class="draw-props"></div>
+        <label class="draw-caption">キャプション
+          <input id="draw-caption" type="text" value="作成した図">
+        </label>
+        <label class="draw-caption">挿入先
+          <select id="draw-target">
+            <option value="end" selected>文末</option>
+          </select>
+        </label>
+        <button id="draw-insert" class="primary-action" type="button" disabled>図を文書に追加</button>
+      </div>
+    </div>
+    <div class="workspace-panel" data-panel="table">
+      <div class="workspace-head"><h2>表</h2></div>
+      <div class="table-builder">
+        <div class="table-config">
+          <label>行
+            <input id="table-rows" type="number" min="1" max="20" value="4">
+          </label>
+          <label>列
+            <input id="table-cols" type="number" min="1" max="12" value="3">
+          </label>
+          <label>配置
+            <select id="table-align">
+              <option value="l">左</option>
+              <option value="c" selected>中央</option>
+              <option value="r">右</option>
+              <option value="X">可変幅</option>
+            </select>
+          </label>
+          <label>スタイル
+            <select id="table-style">
+              <option value="plain">標準</option>
+              <option value="academic" selected>論文</option>
+              <option value="striped">縞</option>
+              <option value="compact">コンパクト</option>
+            </select>
+          </label>
+          <label>列ごとの配置
+            <input id="table-colspec" type="text" placeholder="例: l c X r">
+          </label>
+          <label><input id="table-header" type="checkbox" checked> 1行目を見出し</label>
+          <label><input id="table-lines" type="checkbox" checked> 罫線</label>
+        </div>
+        <div class="tool-row">
+          <button id="table-resize" type="button">表を更新</button>
+          <button id="table-add-row" type="button">行を追加</button>
+          <button id="table-add-col" type="button">列を追加</button>
+          <button id="table-del-row" type="button">行を削除</button>
+          <button id="table-del-col" type="button">列を削除</button>
+        </div>
+        <div class="table-paste">
+          <textarea id="table-paste" placeholder="CSV/TSV/Markdown表を貼り付け" spellcheck="false"></textarea>
+          <button id="table-import" type="button">貼り付けから表を作成</button>
+        </div>
+        <div class="table-merge">
+          <span id="table-selection">セル未選択</span>
+          <label>行結合
+            <input id="table-rowspan" type="number" min="1" max="20" value="1">
+          </label>
+          <label>列結合
+            <input id="table-colspan" type="number" min="1" max="12" value="1">
+          </label>
+          <button id="table-merge-apply" type="button">結合を適用</button>
+          <button id="table-merge-clear" type="button">結合を解除</button>
+        </div>
+        <div id="table-grid" class="table-grid" aria-label="表データ"></div>
+        <label class="draw-caption">キャプション
+          <input id="table-caption" type="text" value="作成した表">
+        </label>
+        <label class="draw-caption">挿入先
+          <select id="table-target">
+            <option value="end" selected>文末</option>
+          </select>
+        </label>
+        <button id="table-insert" class="primary-action" type="button">表を文書に追加</button>
+      </div>
+    </div>
+    <div class="workspace-panel" data-panel="customize">
+      <div class="workspace-head"><h2>文書設定</h2></div>
+      <div class="customize-editor">
+        <section class="insert-card">
+          <h3>ページとクラス</h3>
+          <div class="insert-grid">
+            <label>文書クラス
+              <select id="custom-doc-class">
+                <optgroup label="日本語向け">
+                  <option value="jlreq" selected>jlreq（日本語組版の標準）</option>
+                  <option value="ltjsarticle">ltjsarticle（LuaTeX-ja article）</option>
+                  <option value="ltjsreport">ltjsreport（LuaTeX-ja report）</option>
+                  <option value="ltjsbook">ltjsbook（LuaTeX-ja book）</option>
+                </optgroup>
+                <optgroup label="汎用">
+                  <option value="article">article</option>
+                  <option value="report">report</option>
+                  <option value="book">book</option>
+                </optgroup>
+              </select>
+            </label>
+            <label>クラスオプション
+              <input id="custom-doc-options" type="text" placeholder="11pt">
+            </label>
+            <label>用紙
+              <select id="custom-paper">
+                <option value="a4paper">a4paper</option>
+                <option value="letterpaper">letterpaper</option>
+                <option value="b5paper">b5paper</option>
+              </select>
+            </label>
+            <label>余白
+              <input id="custom-margin" type="text" placeholder="25mm">
+            </label>
+          </div>
+        </section>
+        <section class="insert-card">
+          <h3>タイトル</h3>
+          <div class="insert-grid">
+            <label>タイトル
+              <input id="custom-title" type="text" placeholder="文書タイトル">
+            </label>
+            <label>著者
+              <input id="custom-author" type="text" placeholder="著者名">
+            </label>
+            <label>日付
+              <input id="custom-date" type="text" placeholder="今日の日付 / 2026-07-03">
+            </label>
+            <label class="inline-check"><input id="custom-maketitle" type="checkbox"> タイトルを表示</label>
+          </div>
+        </section>
+        <section class="insert-card">
+          <h3>用途別機能</h3>
+          <p class="setting-note">やりたいことを選ぶと、必要な機能を文書に追加します。</p>
+          <div class="package-presets" aria-label="用途別パッケージ">
+            <button type="button" data-package-preset="math">
+              <span class="package-preset-title">数式</span>
+              <span class="package-preset-desc">amsmath / amssymb</span>
+            </button>
+            <button type="button" data-package-preset="figures">
+              <span class="package-preset-title">図と画像</span>
+              <span class="package-preset-desc">graphicx / float</span>
+            </button>
+            <button type="button" data-package-preset="tables">
+              <span class="package-preset-title">表</span>
+              <span class="package-preset-desc">tabularray / booktabs</span>
+            </button>
+            <button type="button" data-package-preset="refs">
+              <span class="package-preset-title">参照リンク</span>
+              <span class="package-preset-desc">hyperref / cleveref</span>
+            </button>
+            <button type="button" data-package-preset="drawing">
+              <span class="package-preset-title">作図</span>
+              <span class="package-preset-desc">tikz / pgfplots</span>
+            </button>
+            <button type="button" data-package-preset="design">
+              <span class="package-preset-title">意匠</span>
+              <span class="package-preset-desc">xcolor / tcolorbox</span>
+            </button>
+            <button type="button" data-package-preset="code">
+              <span class="package-preset-title">コード掲載</span>
+              <span class="package-preset-desc">kkluaverb</span>
+            </button>
+          </div>
+          <label class="advanced-package-field">上級者向け: 追加パッケージを直接指定
+            <textarea id="custom-packages" spellcheck="false" placeholder="例: xcolor&#10;hyperref[colorlinks=true]"></textarea>
+          </label>
+          <button id="custom-apply" class="primary-action" type="button">文書設定を反映</button>
+        </section>
+        <section class="insert-card">
+          <h3>カスタムテンプレート</h3>
+          <div class="insert-grid">
+            <label>テンプレート名
+              <input id="template-name" type="text" placeholder="講義ノート / 論文ドラフト">
+            </label>
+            <label>説明
+              <input id="template-desc" type="text" placeholder="用紙・パッケージ・定型構成を含む">
+            </label>
+          </div>
+          <button id="template-save" class="primary-action" type="button">現在の文書をテンプレートに保存</button>
+        </section>
+      </div>
+    </div>
+    <div class="workspace-panel" data-panel="ai">
+      <div class="workspace-head"><h2>AI</h2></div>
+      <div class="ai-composer">
+        <div class="ai-lanes">
+          <label class="ai-lane is-active" data-ai-lane="body"><input type="radio" name="ai-lane" value="body" checked>本文編集</label>
+          <label class="ai-lane" data-ai-lane="design"><input type="radio" name="ai-lane" value="design">意匠・sty設計</label>
+        </div>
+        <div class="ai-mode-row" role="group" aria-label="本文編集AI">
+          <label data-ai-scope="body"><input type="radio" name="ai-mode" value="paragraph" checked> 文章</label>
+          <label data-ai-scope="body"><input type="radio" name="ai-mode" value="structure"> 構成</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="sty-integration"> .sty統合</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="macro-design"> マクロ設計</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="box-design"> tcolorbox</label>
+          <label data-ai-scope="design"><input type="radio" name="ai-mode" value="page-style"> 柱・版面</label>
+        </div>
+        <div class="ai-dialog" id="ai-dialog">
+          <div class="ai-message ai-message-assistant" id="ai-assistant-message">本文に入れたい内容を送ると、擬似PDFに追加できるTeX候補を作ります。</div>
+        </div>
+        <div class="insert-grid ai-body-controls">
+          <label>使うコマンド・環境
+            <select id="ai-command">
+              <option value="auto" selected>内容から選ぶ</option>
+              <option value="paragraph">本文</option>
+              <option value="section">節</option>
+              <option value="subsection">小節</option>
+              <option value="equation">数式</option>
+              <option value="align">整列数式</option>
+              <option value="itemize">箇条書き</option>
+              <option value="enumerate">番号付きリスト</option>
+              <option value="description">説明リスト</option>
+              <option value="quote">引用</option>
+              <option value="theorem">定理</option>
+              <option value="lemma">補題</option>
+              <option value="definition">定義</option>
+              <option value="proof">証明</option>
+              <option value="table">表</option>
+              <option value="code">コード</option>
+              <option value="style-package">.styを組み込む</option>
+              <option value="macro">独自マクロ</option>
+              <option value="tcolorbox">独自tcolorbox</option>
+              <option value="page-style">柱デザイン</option>
+            </select>
+          </label>
+          <label>挿入先
+            <select id="ai-target">
+              <option value="end" selected>文末</option>
+            </select>
+          </label>
+        </div>
+        <textarea id="ai-prompt" placeholder="追加・整理したい内容を入力" spellcheck="true"></textarea>
+        <div class="tool-row">
+          <button id="ai-draft" type="button">候補を作成</button>
+          <button id="ai-insert" type="button" disabled>文書に追加</button>
+        </div>
+        <div id="ai-result" class="ai-result ai-draft-card" aria-live="polite"></div>
+      </div>
+    </div>
+    <div class="workspace-panel" data-panel="code">
+      <div class="workspace-head"><h2>コード</h2></div>
+      <div class="code-workbench">
+        <aside class="code-sidebar">
+          <div class="code-sidebar-head">
+            <span>FILES</span>
+            <button id="code-file-pick" type="button" title="ファイルを追加">＋ ファイル</button>
+          </div>
+          <input id="code-file-input" class="visually-hidden" type="file" accept=".tex,.sty,.cls,.bib,.txt,text/plain">
+          <div id="code-file-list" class="code-file-list" aria-live="polite"></div>
+        </aside>
+        <section class="code-editor-pane">
+          <div class="code-editor-head">
+            <span>main.tex</span>
+            <span>LuaLaTeX</span>
+          </div>
+          <div class="code-editor-shell">
+            <pre id="editor-highlight" aria-hidden="true"></pre>
+            <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
+          </div>
+        </section>
+        <aside class="code-preview-pane">
+          <section class="code-detail">
+            <div class="code-detail-head">
+              <h3>ファイルを組み込む</h3>
+              <span id="code-picked-file">未選択</span>
+            </div>
+            <div class="insert-grid">
+              <label>扱い
+                <select id="code-file-kind">
+                  <option value="auto" selected>拡張子から判断</option>
+                  <option value="sty">.styとして読み込む</option>
+                  <option value="tex">分割TeXとして挿入</option>
+                  <option value="bib">文献DBとして参照</option>
+                  <option value="cls">クラスファイルとして保存</option>
+                </select>
+              </label>
+              <label>挿入先
+                <select id="code-file-target">
+                  <option value="end" selected>文末</option>
+                </select>
+              </label>
+            </div>
+            <button id="code-file-integrate" class="primary-action" type="button">選択ファイルを組み込む</button>
+            <div class="code-file-preview">
+              <div class="code-file-preview-head">
+                <span>PREVIEW</span>
+                <span id="code-file-preview-meta">未選択</span>
+              </div>
+              <pre id="code-file-preview-body">ファイルを選択すると内容を確認できます。</pre>
+            </div>
+          </section>
+          <section class="code-detail">
+            <div class="code-detail-head">
+              <h3>部・章ファイルを作成</h3>
+              <span>大型文書用</span>
+            </div>
+            <div class="insert-grid">
+              <label>見出し
+                <input id="code-split-title" type="text" placeholder="第1章 / 先行研究">
+              </label>
+              <label>保存先
+                <input id="code-split-name" type="text" placeholder="chapters/chapter-1.tex">
+              </label>
+              <label>読み込み
+                <select id="code-split-command">
+                  <option value="input" selected>input</option>
+                  <option value="include">include</option>
+                </select>
+              </label>
+              <label>挿入先
+                <select id="code-split-target">
+                  <option value="end" selected>文末</option>
+                </select>
+              </label>
+            </div>
+            <textarea id="code-split-body" spellcheck="true" placeholder="分割ファイルに入れる本文。空なら見出しだけ作成します。"></textarea>
+            <button id="code-split-create" class="primary-action" type="button">分割ファイルを作成して参照を追加</button>
+          </section>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <div id="workspace-preview-splitter" role="separator" aria-orientation="vertical" aria-valuemin="35" aria-valuemax="70" aria-valuenow="48" tabindex="0" title="ドラッグしてワークスペースとプレビューの比率を変更"></div>
 
   <section id="preview-pane">
     <div class="pane-title">Preview <span class="hint">パッチされたページだけが光ります</span>
@@ -38,6 +589,7 @@
         <button id="zoom-fit" title="幅に合わせる">合わせる</button>
       </span>
     </div>
+    <div id="ai-preview-stage" class="ai-preview-stage is-hidden" aria-live="polite"></div>
     <div id="pages"></div>
   </section>
 
@@ -52,6 +604,7 @@
   </aside>
 </main>
 
+<script src="/mathlive/mathlive.min.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
