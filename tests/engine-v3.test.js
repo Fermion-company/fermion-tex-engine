@@ -603,6 +603,37 @@ Tail paragraph after the page break.
   );
 });
 
+test('editing a twocolumn document does not stall on the resident daemon', opts, async () => {
+  await eng.open(String.raw`\documentclass{article}
+\usepackage[a4paper,margin=18mm]{geometry}
+\begin{document}
+\section{Intro}
+Opening paragraph before the columns.
+
+\clearpage
+\twocolumn
+\section{Columns}
+This is genuine two-column material with the sentinel word twocolsentinel here.
+
+More two-column material follows in the active column so the galley has content.
+\onecolumn
+\section{Tail}
+Back to a single column after the two-column zone.
+\end{document}`);
+  const src = eng.getSource();
+  const idx = src.indexOf('twocolsentinel');
+  assert.ok(idx > 0, 'sentinel present in the two-column region');
+  // The resident dormant-page daemon deadlocks on real two-column mode, so a
+  // twocolumn edit must skip the live-draft typeset entirely and lean on the
+  // async exact render — otherwise every keystroke blocks on a 30s job timeout.
+  const t0 = performance.now();
+  const report = await eng.edit(idx, idx + 'twocolsentinel'.length, 'edited');
+  const wall = performance.now() - t0;
+  assert.ok(wall < 3000, `twocolumn edit must not stall on the daemon (took ${wall.toFixed(0)}ms)`);
+  assert.equal(report.stats.blocksTypeset, 0, 'no resident block typeset for a twocolumn edit');
+  assert.equal(report.stats.fullPagePreviewPending, true, 'exact render is queued for the twocolumn edit');
+});
+
 test('paracol exposes independently editable, column-tagged child regions', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \usepackage[a4paper,margin=18mm]{geometry}

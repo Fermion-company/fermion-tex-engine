@@ -868,7 +868,16 @@ export class CheckpointEngine {
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
-    const earlyFullPagePreview = editLabel === 'open' ? fullPagePreviewReason(text) : '';
+    // Full-page-exact documents skip the resident typeset on the initial open.
+    // They ALSO skip it on edit when the resident dormant-page daemon cannot
+    // typeset the document's layout — real two-column mode (\twocolumn,
+    // twocolumn class, balancing multicols 4+) deadlocks the daemon (see
+    // multicol-resident-instability). Those edits keep the last exact pages and
+    // let the async exact render catch up, instead of hanging on a live draft.
+    // paracol typesets fine on the resident path, so it keeps its instant draft.
+    const previewReason = fullPagePreviewReason(text);
+    const earlyFullPagePreview =
+      previewReason && (editLabel === 'open' || residentDraftUnsafe(text)) ? previewReason : '';
     if (earlyFullPagePreview) {
       let pages;
       let reused = 0;
@@ -2269,6 +2278,22 @@ function fullPagePreviewReason(text) {
   if (/\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(text)) return 'twocolumn class option';
   if (/\\twocolumn\b/.test(text)) return '\\twocolumn command';
   return '';
+}
+
+// True when the resident dormant-page daemon cannot safely typeset this
+// document's layout, so the live-draft resident typeset must be skipped in
+// favor of the async exact render. Real two-column mode — \twocolumn /
+// \onecolumn, the twocolumn class option, or balancing multicols with 4+
+// columns — deadlocks or crashes the daemon (see multicol-resident-instability).
+// paracol typesets fine on the resident path and is intentionally NOT unsafe, so
+// it keeps its instant live draft.
+function residentDraftUnsafe(text) {
+  if (/\\(?:twocolumn|onecolumn)\b/.test(text)) return true;
+  if (/\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(text)) return true;
+  for (const m of text.matchAll(/\\begin\s*\{multicols\}\s*\{(\d+)\}/g)) {
+    if ((Number(m[1]) || 0) >= 4) return true;
+  }
+  return false;
 }
 
 function multicolBlockInfo(text) {
