@@ -2958,9 +2958,9 @@ function buildMulticolTex() {
   const title = multicolTitleEl?.value?.trim() || '';
   const body = multicolBodyEl?.value?.trim() || 'ここに本文を入力します。';
   const parts = [];
-  if (title) parts.push(`\\section{${title}}`);
+  if (title) parts.push(`\\section{${escapeLatexText(title)}}`);
   parts.push(`\\begin{${env}}{${cols}}`);
-  parts.push(body);
+  parts.push(escapeLatexText(body));
   parts.push(`\\end{${env}}`);
   return `\n${parts.join('\n')}\n`;
 }
