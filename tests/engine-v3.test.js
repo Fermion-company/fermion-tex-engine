@@ -559,3 +559,101 @@ Back to normal width.
     rmSync(LIVE_WORK, { recursive: true, force: true });
   }
 });
+
+test('native shipout hitboxes cover short blocks and skip page-break blocks', opts, async () => {
+  await eng.open(String.raw`\documentclass{article}
+\usepackage[a4paper,margin=18mm]{geometry}
+\usepackage{paracol}
+\begin{document}
+\section{Intro}
+Plain paragraph before the columns.
+
+\begin{paracol}{2}
+Left column filler paragraph.
+\switchcolumn
+Right column filler paragraph.
+\end{paracol}
+
+\clearpage
+\section{Tail}
+Tail paragraph after the page break.
+\end{document}`);
+  const commands = eng.getDisplayLists().flatMap((p) => p.commands.map((c) => ({ ...c, page: p.page })));
+
+  // Short headings (no unique long terms) used to be dropped by the pdftotext
+  // heuristic; native per-glyph attribution gives them a real box.
+  for (const title of ['Intro', 'Tail']) {
+    const block = eng.blocks.find((b) => new RegExp(`\\\\section\\{${title}\\}`).test(b.text));
+    const hits = commands.filter((c) => c.op === 'hitbox' && c.src === block.id);
+    assert.ok(hits.length > 0, `native hitbox recovered for short heading ${title}`);
+  }
+  // Tail lives after \clearpage, so its box is on page 2, never page 1.
+  const tail = eng.blocks.find((b) => /\\section\{Tail\}/.test(b.text));
+  assert.ok(
+    commands.filter((c) => c.op === 'hitbox' && c.src === tail.id).every((c) => c.page === 2),
+    'Tail heading hitbox stays on its own page'
+  );
+  // A page-break-only block sets no ink, so it must not claim the page number.
+  const clearBlock = eng.blocks.find((b) => /^\s*\\clearpage/.test(b.text));
+  assert.ok(clearBlock, 'clearpage is its own block');
+  assert.equal(
+    commands.filter((c) => c.op === 'hitbox' && c.src === clearBlock.id).length,
+    0,
+    'clearpage block gets no stray footer hitbox'
+  );
+});
+
+test('paracol exposes independently editable, column-tagged child regions', opts, async () => {
+  await eng.open(String.raw`\documentclass{article}
+\usepackage[a4paper,margin=18mm]{geometry}
+\usepackage{paracol}
+\begin{document}
+\section{Intro}
+Before the columns.
+
+\begin{paracol}{2}
+\section{Left Stream}
+Left body with sentinel wordleftbody.
+\switchcolumn
+\section{Right Stream}
+Right body with sentinel wordrightbody.
+\end{paracol}
+
+\section{After}
+After the columns.
+\end{document}`);
+
+  const owner = eng.blocks.find((b) => /\\begin\{paracol\}/.test(b.text));
+  const dom = eng.getDOM();
+  const regions = dom.regions.filter((r) => r.owner === owner.id);
+  assert.ok(regions.length >= 4, 'paracol owner split into per-heading/paragraph child regions');
+  // Top-level blocks are NOT polluted with regions.
+  assert.ok(!dom.blocks.some((b) => b.id.includes('.r')), 'child regions stay out of the block list');
+
+  const src = eng.getSource();
+  const leftHeading = regions.find((r) => /Left Stream/.test(src.slice(r.span.start, r.span.end)));
+  const rightHeading = regions.find((r) => /Right Stream/.test(src.slice(r.span.start, r.span.end)));
+  assert.equal(leftHeading.column, 0, 'left track region is column 0');
+  assert.equal(rightHeading.column, 1, 'right track region is column 1');
+  assert.equal(leftHeading.type, 'heading', 'heading region is typed as a heading');
+  // The region span slices exactly its own source — the basis for scoped editing.
+  assert.equal(src.slice(leftHeading.span.start, leftHeading.span.end), '\\section{Left Stream}');
+
+  const commands = eng.getDisplayLists().flatMap((p) => p.commands);
+  const regionHits = commands.filter((c) => c.op === 'hitbox' && c.region);
+  assert.ok(regionHits.some((c) => c.src === leftHeading.id && c.column === 0), 'left region has its own column-0 hitbox');
+  assert.ok(regionHits.some((c) => c.src === rightHeading.id && c.column === 1), 'right region has its own column-1 hitbox');
+  const geo = eng.getGeometry();
+  assert.ok(regionHits.every((c) => c.w < geo.textwidth * 0.65), 'region hitboxes stay column-sized');
+
+  // Editing a region rewrites only its slice; the owner stays a complete env,
+  // so the resident daemon never receives a partial paracol fragment.
+  const at = src.indexOf('Stream', leftHeading.span.start);
+  await eng.edit(at, at + 'Stream'.length, 'Column');
+  const ownerAfter = eng.blocks.find((b) => b.id === owner.id);
+  assert.ok(
+    /\\begin\{paracol\}/.test(ownerAfter.text) && /\\end\{paracol\}/.test(ownerAfter.text),
+    'owner remains a whole paracol environment after a region edit'
+  );
+  assert.ok(/Left Column/.test(ownerAfter.text), 'region edit landed inside the owner');
+});

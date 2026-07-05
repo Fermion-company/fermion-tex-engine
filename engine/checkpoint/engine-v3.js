@@ -188,6 +188,29 @@ export class CheckpointEngine {
           span: b.file ? null : { start: b.start, end: b.end },
         };
       }),
+      // Environment child regions: independently editable views into an owner
+      // block (paracol/multicols headings & paragraphs). Kept separate from
+      // `blocks` so the outline/structure stay owner-grained, while the preview
+      // can open a region and edit only its slice — the owner re-typesets whole,
+      // so the resident daemon never receives partial TeX.
+      regions: this.blocks.flatMap((b) =>
+        b.file
+          ? []
+          : (b.children ?? []).map((child) => ({
+              id: child.id,
+              owner: child.ownerId,
+              type: child.kind,
+              column: child.column,
+              layout: child.layout,
+              source: {
+                file: this.file,
+                start: this.store.position(this.file, child.start),
+                end: this.store.position(this.file, child.end),
+              },
+              span: { start: child.start, end: child.end },
+              pages: blockPages.get(child.id) ?? [],
+            }))
+      ),
       labels: Object.fromEntries(this.labelTable),
     };
   }
@@ -228,6 +251,9 @@ export class CheckpointEngine {
       text: s.text,
       hash: s.hash,
     }));
+    // Attach the same environment child regions the live engine exposes, so the
+    // instrumentation can mark each region and glyphs come back region-tagged.
+    for (const b of blocks) b.children = environmentChildren(b);
 
     const lua = path.join(jobdir, 'page-layout-poc.lua');
     const meta = path.join(jobdir, 'page-layout-poc.json');
@@ -836,6 +862,9 @@ export class CheckpointEngine {
     segs = this.#expandIncludes(segs, 0);
     const diff = diffBlocks(this.blocks, segs, () => this.idSeq++);
     this.blocks = diff.blocks;
+    // Recompute environment child regions (cheap; non-empty only for column
+    // environments) so getDOM and native hitboxes see fresh, editable children.
+    for (const b of this.blocks) b.children = environmentChildren(b);
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
@@ -1475,6 +1504,32 @@ export class CheckpointEngine {
   }
 
   async #fullPagePreview(text, jobTag = 'sync', shouldApply = () => true) {
+    const geo = this.geometry ?? {};
+    const w = geo.paperwidth ?? 612;
+    const h = geo.paperheight ?? 792;
+
+    // Preferred path: native shipout instrumentation. The pre_shipout_filter
+    // callback attributes every glyph to the block that produced it, so edit
+    // hitboxes are recovered from real per-block glyph boxes instead of from
+    // fuzzy pdftotext word matching. That removes both failure modes of the
+    // heuristic: short/common-word blocks that got no box, and boxes landing
+    // on the wrong page. Fall back to the pdftotext path if the native
+    // capture is unavailable (no fork shim, instrumentation compile error…).
+    let native = null;
+    try {
+      native = await this.buildNativePageLayoutPoc({ text, jobTag: `fp-${jobTag}` });
+      if (!native.pdf || !native.pageCount) native = null;
+    } catch (err) {
+      this.diagnostics.push(`native page-layout capture unavailable (${err.message}); using pdftotext hitboxes`);
+      native = null;
+    }
+
+    if (native) {
+      const hitboxes = this.#nativeFullPageHitboxes(native, w, h);
+      const nativeDir = path.dirname(native.pdf);
+      return this.#assembleFullPagePages(native.pdf, native.pageCount, hitboxes, w, h, nativeDir, shouldApply);
+    }
+
     const safeTag = String(jobTag).replace(/[^0-9A-Za-z_-]+/g, '_');
     const jobdir = path.join(this.workDir, `full-page-preview-${safeTag}`);
     rmSync(jobdir, { recursive: true, force: true });
@@ -1500,13 +1555,16 @@ export class CheckpointEngine {
     const info = await execFileP('pdfinfo', [pdf], { timeout: 30_000 });
     const pageCount = Number(info.stdout.match(/^Pages:\s+(\d+)/m)?.[1] ?? 0);
     if (!pageCount) throw new Error('could not read full-page PDF page count');
-    const geo = this.geometry ?? {};
-    const w = geo.paperwidth ?? 612;
-    const h = geo.paperheight ?? 792;
     const hitboxes = await this.#fullPageHitboxes(pdf, w, h).catch((err) => {
       this.diagnostics.push(`full-page hitboxes unavailable: ${err.message}`);
       return new Map();
     });
+    return this.#assembleFullPagePages(pdf, pageCount, hitboxes, w, h, jobdir, shouldApply);
+  }
+
+  // Render each page of a full-page PDF to SVG and pack it with its edit
+  // hitboxes into a display list. Shared by the native and pdftotext paths.
+  async #assembleFullPagePages(pdf, pageCount, hitboxes, w, h, jobdir, shouldApply) {
     const pageSvgs = [];
     for (let n = 1; n <= pageCount; n++) {
       const key = `_fullpage-${n}`;
@@ -1553,6 +1611,89 @@ export class CheckpointEngine {
       });
     }
     return pages;
+  }
+
+  // Build edit hitboxes from native per-glyph block attribution. Each glyph the
+  // shipout callback captured carries the id of the block it came from plus its
+  // exact ink metrics, so a block's hitbox is just the union of its glyph boxes
+  // — no term matching, no page guessing. Column environments still emit one
+  // box per column (and per source child region, when the segmenter split the
+  // environment) so the preview stays column-editable.
+  #nativeFullPageHitboxes(native, pageW, pageH) {
+    const ORIGIN = 72; // pdf horigin/vorigin default = 1in = 72bp (see probe)
+    const blockById = new Map(this.blocks.map((b) => [b.id, b]));
+    const childById = this.#childRegions();
+    const toBoxes = (glyphs) =>
+      glyphs.map((g) => ({
+        x0: g.x + ORIGIN,
+        y0: g.y - (g.h ?? 0) + ORIGIN,
+        x1: g.x + (g.w ?? 0) + ORIGIN,
+        y1: g.y + (g.d ?? 0) + ORIGIN,
+      }));
+    const out = new Map();
+    for (const page of native.pages ?? []) {
+      const byKey = new Map();
+      for (const g of page.glyphs ?? []) {
+        if (!g.block) continue;
+        // Glyphs tagged with a child region report under the region id so the
+        // region gets its own box; the region still names its owning block.
+        const key = g.region || g.block;
+        if (!byKey.has(key)) byKey.set(key, { block: g.block, region: g.region || null, glyphs: [] });
+        byKey.get(key).glyphs.push(g);
+      }
+      const rects = [];
+      for (const { block: bid, region, glyphs } of byKey.values()) {
+        const block = blockById.get(bid);
+        if (!block) continue;
+        const boxes = toBoxes(glyphs);
+
+        // --- child region of a column environment (independently editable) ---
+        if (region) {
+          const child = childById.get(region);
+          if (!child) continue;
+          if (Number.isFinite(child.column)) {
+            // paracol: the column is known statically — one tight box.
+            for (const rect of rectsForWords(boxes, { pageW, pageH })) {
+              rects.push({ src: region, region, owner: bid, layout: child.layout, column: child.column, x: r2(rect.x), y: r2(rect.y), w: r2(rect.w), h: r2(rect.h) });
+            }
+          } else {
+            // multicols: content flows across columns; recover them from x.
+            for (const box of columnRectsForWords(boxes, child.cols ?? 2, pageW, pageH)) {
+              rects.push({ src: region, region, owner: bid, layout: child.layout, column: box.col, x: r2(box.x), y: r2(box.y), w: r2(box.w), h: r2(box.h) });
+            }
+          }
+          continue;
+        }
+
+        // --- whole-block hitbox (no child regions covered these glyphs) ---
+        // A page-break-only block (\clearpage, \newpage, \onecolumn…) ships no
+        // ink of its own. Any glyph tagged to it is the page footer/header the
+        // output routine emitted while its start marker was the active block —
+        // dropping it avoids a stray hitbox over the page number.
+        if (!blockHasVisibleText(block.text)) continue;
+        const columnInfo = columnLayoutBlockInfo(block.text);
+        if (columnInfo) {
+          for (const box of columnRectsForWords(boxes, columnInfo.cols, pageW, pageH)) {
+            rects.push({ src: bid, layout: columnInfo.layout, column: box.col, x: r2(box.x), y: r2(box.y), w: r2(box.w), h: r2(box.h) });
+          }
+          continue;
+        }
+        for (const rect of rectsForWords(boxes, { pageW, pageH })) {
+          rects.push({ src: bid, x: r2(rect.x), y: r2(rect.y), w: r2(rect.w), h: r2(rect.h) });
+        }
+      }
+      if (rects.length) out.set(page.number, rects);
+    }
+    return out;
+  }
+
+  // Map child-region id -> child descriptor, across all environment blocks.
+  #childRegions() {
+    const map = new Map();
+    for (const block of this.blocks) {
+      for (const child of block.children ?? []) map.set(child.id, child);
+    }
+    return map;
   }
 
   async #fullPageHitboxes(pdf, pageW, pageH) {
@@ -2154,6 +2295,63 @@ function forcesFullPageBreak(text) {
   return /\\(?:clearpage|cleardoublepage|onecolumn|twocolumn)\b/.test(text);
 }
 
+// Environment-aware source tree. A column environment (paracol/multicols) stays
+// a single atomic block for typesetting — the resident daemon always receives
+// the whole, compilable environment, never a broken fragment. On top of that
+// atomic owner we expose independently editable *child regions*: each heading
+// or paragraph inside the environment, carrying the column it belongs to.
+//
+// Editing a child never detaches it: a region edit rewrites a slice of the
+// owner's source (via the region's document offsets) and the whole environment
+// is re-typeset. This is the owner/continuation model — children are views into
+// the owner, so no partial TeX ever reaches the daemon.
+//
+// paracol columns are known statically from \switchcolumn boundaries; multicols
+// flows automatically, so its regions carry column=null and the column is
+// resolved from glyph x at hitbox time.
+function environmentChildren(block) {
+  const info = columnLayoutBlockInfo(block.text);
+  if (!info) return [];
+  const open = /\\begin\s*\{(?:multicols\*?|paracol\*?)\}\s*(?:\[[^\]]*\])?\s*\{\d+\}/.exec(block.text);
+  if (!open) return [];
+  const innerStart = open.index + open[0].length;
+  const close = /\\end\s*\{(?:multicols\*?|paracol\*?)\}/.exec(block.text.slice(innerStart));
+  const innerEnd = close ? innerStart + close.index : block.text.length;
+  const inner = block.text.slice(innerStart, innerEnd);
+  if (!inner.trim()) return [];
+  const segs = segmentBody(inner, innerStart);
+  if (segs.length <= 1) return [];
+  const switches = [];
+  for (const sw of block.text.matchAll(/\\switchcolumn\*?/g)) {
+    if (sw.index >= innerStart && sw.index < innerEnd) switches.push(sw.index);
+  }
+  const children = [];
+  let n = 0;
+  for (const s of segs) {
+    // structural-only segments (\switchcolumn, stray \columnbreak) set no ink
+    // and must not become editable regions
+    if (!blockHasVisibleText(s.text)) continue;
+    n++;
+    const column =
+      info.layout === 'paracol'
+        ? switches.filter((off) => off < s.start).length % info.cols
+        : null;
+    children.push({
+      id: `${block.id}.r${n}`,
+      ownerId: block.id,
+      start: block.start + s.start,
+      end: block.start + s.end,
+      text: s.text,
+      hash: s.hash,
+      column,
+      cols: info.cols,
+      layout: info.layout,
+      kind: HEADING_RE.test(s.text) ? 'heading' : 'block',
+    });
+  }
+  return children;
+}
+
 function dimBp(v) {
   return `${Math.max(0, Number(v) || 0).toFixed(6)}bp`;
 }
@@ -2238,6 +2436,18 @@ function parsePdfBboxWords(xml) {
     pages.push({ n, words });
   }
   return pages;
+}
+
+// True when a block would set at least one visible glyph of its own: after
+// stripping comments, control sequences and structural punctuation, some
+// letter or digit remains. Blocks like \clearpage strip to nothing.
+function blockHasVisibleText(text) {
+  const stripped = String(text || '')
+    .replace(/%[^\n]*/g, ' ')
+    .replace(/\\[a-zA-Z@]+\*?/g, ' ')
+    .replace(/\\[^a-zA-Z]/g, ' ')
+    .replace(/[{}[\]$^_~&#]/g, ' ');
+  return /[0-9A-Za-z]/.test(stripped);
 }
 
 function significantTerms(tex) {
@@ -2353,7 +2563,7 @@ function instrumentPageLayoutPocSource(text, bounds, blocks, luaPath, metaPath, 
     body.push(text.slice(cursor, block.start));
     body.push(`\n\\directlua{tdom_poc_register_block('${luaStr(block.id)}',${block.index},${block.start},${block.end})}\n`);
     body.push(`\\special{tdom:poc:start:${block.id}}\n`);
-    body.push(block.text);
+    body.push(instrumentBlockRegions(block));
     body.push(`\n\\special{tdom:poc:end:${block.id}}\n`);
     cursor = block.end;
   }
@@ -2365,6 +2575,28 @@ function instrumentPageLayoutPocSource(text, bounds, blocks, luaPath, metaPath, 
   return text.slice(0, bounds.body.start) + setup + body.join('') + text.slice(bounds.body.end);
 }
 
+// Splice region markers into a block's source at its child-region boundaries.
+// The markers are \special whatsits (zero-dimension), so the shipped page is
+// pixel-identical while every glyph inside a region is attributable to it.
+function instrumentBlockRegions(block) {
+  const children = block.children ?? [];
+  if (!children.length) return block.text;
+  const parts = [];
+  let cursor = 0;
+  for (const child of children) {
+    const rs = child.start - block.start;
+    const re = child.end - block.start;
+    if (rs < cursor || re < rs || re > block.text.length) continue;
+    parts.push(block.text.slice(cursor, rs));
+    parts.push(`\n\\special{tdom:poc:rstart:${child.id}}\n`);
+    parts.push(block.text.slice(rs, re));
+    parts.push(`\n\\special{tdom:poc:rend:${child.id}}\n`);
+    cursor = re;
+  }
+  parts.push(block.text.slice(cursor));
+  return parts.join('');
+}
+
 function pageLayoutPocLuaSource() {
   return String.raw`
 local OUT = nil
@@ -2373,6 +2605,7 @@ local fk = nil
 local pages = {}
 local blocks = {}
 local active_block = nil
+local active_region = nil
 local current_page = nil
 local page_block_seen = nil
 
@@ -2445,6 +2678,7 @@ local function check_marker(n)
   local start_id = n.data:match('^tdom:poc:start:([%w_%-]+)$')
   if start_id then
     active_block = start_id
+    active_region = nil
     note_block(active_block)
     return true
   end
@@ -2452,6 +2686,17 @@ local function check_marker(n)
   if end_id then
     note_block(end_id)
     if active_block == end_id then active_block = nil end
+    active_region = nil
+    return true
+  end
+  local rstart_id = n.data:match('^tdom:poc:rstart:([%w_%-%.]+)$')
+  if rstart_id then
+    active_region = rstart_id
+    return true
+  end
+  local rend_id = n.data:match('^tdom:poc:rend:([%w_%-%.]+)$')
+  if rend_id then
+    if active_region == rend_id then active_region = nil end
     return true
   end
   return false
@@ -2468,9 +2713,15 @@ local function emit_glyph(n, x, baseline)
   if block then note_block(block) end
   current_page.glyphs[#current_page.glyphs + 1] = {
     block = block or '',
+    region = active_region,
     text = ch,
     x = bp(x + (n.xoffset or 0)),
     y = bp(baseline - (n.yoffset or 0)),
+    -- glyph metrics let the host reconstruct an exact ink box:
+    -- [x, x+w] horizontally and [y-h, y+d] vertically (top-left page frame)
+    w = bp(n.width or 0),
+    h = bp(n.height or 0),
+    d = bp(n.depth or 0),
     font = f.name or f.fullname or '',
     size = bp(f.size or 0),
   }

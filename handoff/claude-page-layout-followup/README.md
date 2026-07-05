@@ -1,5 +1,9 @@
 # Claude Handoff: Page Layout Follow-up
 
+> Follow-up work on "Suggested next steps" 1–3 (native hitboxes, environment-aware
+> regions, live-draft/exact UI state) is done — see
+> `handoff/claude-native-hitboxes/README.md`.
+
 ## Current state
 
 - Branch: `codex/page-layout-poc`

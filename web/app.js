@@ -13,6 +13,7 @@ const editor = document.getElementById('editor');
 const editorHighlightEl = document.getElementById('editor-highlight');
 const pagesEl = document.getElementById('pages');
 const statusEl = document.getElementById('status');
+const previewStateEl = document.getElementById('preview-state');
 const inspectorEl = document.getElementById('inspector');
 const menuToggleButton = document.getElementById('menu-toggle');
 const layoutViewEl = document.getElementById('layout-view');
@@ -147,6 +148,9 @@ const drawClearButton = document.getElementById('draw-clear');
 const drawCaptionEl = document.getElementById('draw-caption');
 const drawTargetEl = document.getElementById('draw-target');
 const workspaceBlocks = new Map();
+// Environment child regions, keyed by region id — kept apart from
+// workspaceBlocks so outline/structure stay owner-grained.
+const workspaceRegions = new Map();
 let referenceLabels = [];
 let bibliographyItems = [];
 let selectedWordBlockId = null;
@@ -445,6 +449,8 @@ function renderWorkspace(doc, dom) {
   const blocks = (dom.blocks ?? []).filter((block) => block.span);
   workspaceBlocks.clear();
   for (const block of blocks) workspaceBlocks.set(block.id, block);
+  workspaceRegions.clear();
+  for (const region of dom.regions ?? []) workspaceRegions.set(region.id, region);
   const headings = blocks.filter((block) => block.type === 'heading');
   const labels = collectLabels(blocks);
   const refs = collectRefs(blocks);
@@ -1776,6 +1782,27 @@ function removePagesFrom(from) {
   }
 }
 
+// Preview freshness badge for full-page exact documents. An edit first shows
+// the resident live *draft*; the exact page image is rebuilt asynchronously and
+// swapped in. 'draft' persists until the exact render arrives; 'exact' flashes
+// briefly on arrival; anything else clears the badge.
+let previewStateHideTimer = null;
+function setPreviewState(state) {
+  if (!previewStateEl) return;
+  clearTimeout(previewStateHideTimer);
+  if (state === 'draft') {
+    previewStateEl.className = 'preview-state is-draft';
+    previewStateEl.textContent = '下書き · 正確なページを生成中…';
+  } else if (state === 'exact') {
+    previewStateEl.className = 'preview-state is-exact';
+    previewStateEl.textContent = '正確なページに更新';
+    previewStateHideTimer = setTimeout(() => setPreviewState('none'), 2500);
+  } else {
+    previewStateEl.className = 'preview-state is-hidden';
+    previewStateEl.textContent = '';
+  }
+}
+
 function applyReport(report) {
   if (report.rev <= appliedRev) return;
   appliedRev = report.rev;
@@ -1842,6 +1869,7 @@ function flushSync() {
           : backend === 'lualatex'
             ? `lualatex ${report.stats.lualatexMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
             : `engine ${fmtUs(report.stats.totalUs)}`;
+      setPreviewState(report.stats.fullPagePreviewPending ? 'draft' : 'none');
       const exactPending = report.stats.fullPagePreviewPending ? ' / exact更新中' : '';
       statusEl.textContent =
         `update #${report.rev} [${backend}] — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
@@ -1878,7 +1906,7 @@ pagesEl.addEventListener('click', async (ev) => {
   if (!src) return;
   if (ev.altKey) {
     const dom = await fetch('/dom').then((r) => r.json());
-    const block = dom.blocks.find((b) => b.id === src);
+    const block = editableNode(dom, src);
     if (!block) return;
     const offset = lineColToOffset(editor.value, block.source.start.line, block.source.start.column);
     editor.focus();
@@ -2615,7 +2643,7 @@ function buildImageFigureTex(asset) {
 function insertTexAtTarget(source, tex, targetId) {
   const trimmedTex = tex.replace(/^\n*/, '\n').replace(/\n*$/, '\n');
   if (targetId && targetId !== 'end') {
-    const block = workspaceBlocks.get(targetId);
+    const block = workspaceBlocks.get(targetId) ?? workspaceRegions.get(targetId);
     if (block?.span) {
       const insertAt = block.span.end;
       return source.slice(0, insertAt).trimEnd() + trimmedTex + source.slice(insertAt);
@@ -5372,10 +5400,18 @@ function buildPreviewInsertTex(type, title, body) {
   return `\n${escapeLatexText(text)}\n`;
 }
 
+// Resolve a preview src to an editable node: a top-level block, or a child
+// region of a column environment (paracol/multicols). Regions carry their own
+// source span, so editing one rewrites just that slice while the owner block
+// re-typesets whole — the resident daemon never sees partial TeX.
+function editableNode(dom, src) {
+  return dom.blocks.find((b) => b.id === src) ?? dom.regions?.find((r) => r.id === src) ?? null;
+}
+
 async function openBox(src, anchorEl = null, point = null) {
   closeBox();
   const dom = await fetch('/dom').then((r) => r.json());
-  const block = dom.blocks.find((b) => b.id === src);
+  const block = editableNode(dom, src);
   if (!block) return;
   if (block.file || !block.span) {
     statusEl.textContent = 'このブロックは \\input ファイル由来のため、ここでは編集できません';
@@ -6829,6 +6865,7 @@ sse.onmessage = (ev) => {
       renderInspector(msg.report, null);
       if (msg.report.edit?.startsWith('async full-page preview:')) {
         statusEl.textContent = `async preview #${msg.report.rev} [${backend}] — exact更新完了`;
+        setPreviewState('exact');
       }
       fetch('/doc')
         .then((r) => r.json())
