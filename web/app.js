@@ -933,6 +933,8 @@ function displayTitleForBlock(block, source) {
   if (math) return math.label ? `数式 ${math.label}` : '数式';
   const code = parseCodeBlockLens(raw);
   if (code) return code.title;
+  const multicol = parseMulticolLens(raw);
+  if (multicol) return multicolEnvironmentLabel(multicol.cols);
   const caption = raw.match(/\\caption\{([^{}]*)\}/)?.[1];
   if (caption) return caption.trim();
   return blockTypeLabel(block, source);
@@ -960,6 +962,8 @@ function displayBodyForBlock(block, source) {
   if (list) return list.items.map((item) => `- ${item.text}`).join(' ').slice(0, 180);
   const alignment = parseAlignmentLens(raw);
   if (alignment) return stripTexForDisplay(alignment.body).slice(0, 180);
+  const multicol = parseMulticolLens(raw);
+  if (multicol) return stripTexForDisplay(multicol.body).slice(0, 180);
   const math = parseMathLens(raw);
   if (math) return math.math.replace(/\s+/g, ' ').slice(0, 120);
   return stripTexForDisplay(raw).slice(0, 180);
@@ -978,6 +982,8 @@ function blockTypeLabel(block, source = '') {
   if (list) return listEnvironmentLabel(list.env);
   const alignment = parseAlignmentLens(raw);
   if (alignment) return alignmentEnvironmentLabel(alignment.env);
+  const multicol = parseMulticolLens(raw);
+  if (multicol) return multicolEnvironmentLabel(multicol.cols);
   if (/\\begin\{figure\}/.test(raw)) return '図';
   if (/\\begin\{table\}/.test(raw)) return '表';
   if (block.type === 'graphics') return 'TeXオブジェクト';
@@ -1191,6 +1197,19 @@ function wordModelFromSource(raw, block) {
       raw,
     };
   }
+  const multicol = parseMulticolLens(raw);
+  if (multicol) {
+    return {
+      kind: 'multicol',
+      env: multicol.env,
+      cols: multicol.cols,
+      title: multicolEnvironmentLabel(multicol.cols),
+      label: null,
+      body: stripEditableParagraph(multicol.body),
+      bodyLabel: '本文',
+      raw,
+    };
+  }
   if (blockTypeLabel(block, editor.value) === '本文') {
     return { kind: 'paragraph', label: null, body: stripEditableParagraph(raw), bodyLabel: '本文', raw };
   }
@@ -1273,6 +1292,21 @@ function alignmentEnvironmentLabel(env) {
     flushleft: '左揃え',
     flushright: '右揃え',
   }[env] || env;
+}
+
+function parseMulticolLens(raw) {
+  const match = raw.match(/^(\s*)\\begin\{(multicols\*?)\}\{(\d+)\}\s*([\s\S]*?)\s*\\end\{\2\}\s*$/);
+  if (!match) return null;
+  return {
+    env: match[2],
+    cols: Math.max(2, Math.min(20, Number(match[3]) || 2)),
+    starred: match[2].endsWith('*'),
+    body: match[4].trim(),
+  };
+}
+
+function multicolEnvironmentLabel(cols) {
+  return `${cols}段組`;
 }
 
 function parseSimpleTableLens(raw) {
@@ -1402,6 +1436,15 @@ function buildWordModelSource(model, form) {
   }
   if (model.kind === 'alignment') {
     return buildAlignmentTex(model.env, body);
+  }
+  if (model.kind === 'multicol') {
+    const env = model.env === 'multicols*' ? 'multicols*' : 'multicols';
+    // the visible "n段組" title doubles as the column-count control: honor a
+    // number typed there, else keep the parsed count
+    const titleField = form.querySelector('[data-word-field="title"]')?.value ?? '';
+    const typed = Number(String(titleField).match(/\d+/)?.[0]);
+    const cols = Math.max(2, Math.min(20, typed >= 2 ? typed : (Number(model.cols) || 2)));
+    return `\\begin{${env}}{${cols}}\n${escapeLatexText(body)}\n\\end{${env}}\n`;
   }
   if (model.kind === 'theoremLike') {
     if (model.env === 'proof') return `\\begin{proof}\n${escapeLatexText(body)}\n\\end{proof}\n`;
@@ -1645,8 +1688,10 @@ function renderPage(dl, flash) {
 function renderHitboxes(pageDiv, dl) {
   const W = geometry.paperwidth;
   const H = geometry.paperheight;
-  for (const cmd of dl.commands) {
-    if (cmd.op !== 'hitbox') continue;
+  const hitboxes = dl.commands
+    .filter((cmd) => cmd.op === 'hitbox')
+    .sort((a, b) => Number(!!a.layout) - Number(!!b.layout));
+  for (const cmd of hitboxes) {
     const layoutAttr = cmd.layout ? ` data-layout="${escapeHtml(cmd.layout)}"` : '';
     const columnAttr = Number.isFinite(cmd.column) ? ` data-column="${cmd.column}"` : '';
     pageDiv.insertAdjacentHTML(
@@ -4928,6 +4973,8 @@ const hoverBox = document.createElement('div');
 hoverBox.id = 'hoverbox';
 const selectedPreviewBox = document.createElement('div');
 selectedPreviewBox.id = 'selected-preview-box';
+selectedPreviewBox.className = 'selected-preview-box';
+const extraSelectedPreviewBoxes = [];
 const previewInsertButton = document.createElement('button');
 previewInsertButton.type = 'button';
 previewInsertButton.className = 'preview-insert-button';
@@ -5031,7 +5078,7 @@ function blockRect(pageDiv, src, anchorEl = null, point = null) {
     .filter(({ rect }) => rect.width !== 0 || rect.height !== 0);
   if (!rects.length) return null;
   let selectedRects = rects.map(({ rect }) => rect);
-  const isMulticol = [...els].some((el) => el.getAttribute?.('data-layout') === 'multicol');
+  const isColumnLayout = [...els].some((el) => ['multicol', 'paracol'].includes(el.getAttribute?.('data-layout')));
   const anchor = anchorEl?.closest?.(`[data-src="${src}"]`) ?? (anchorEl?.dataset?.src === src ? anchorEl : null);
   let anchorRect = anchor?.getBoundingClientRect?.() ?? null;
   if (!anchorRect && point) {
@@ -5048,7 +5095,7 @@ function blockRect(pageDiv, src, anchorEl = null, point = null) {
     let candidates = rects.map(({ rect }) => rect);
     const lineStarts = columnLineStarts(candidates, p.width);
     const splitInfo = columnSplitFromStarts(lineStarts, p.width);
-    if (splitInfo || (isMulticol && point)) {
+    if (splitInfo || (isColumnLayout && point)) {
       const anchorCenter = (anchorRect.left + anchorRect.right) / 2;
       const split = splitInfo?.split ?? (p.left + p.width / 2);
       const left = anchorCenter < split ? -Infinity : split;
@@ -5080,6 +5127,29 @@ function blockRect(pageDiv, src, anchorEl = null, point = null) {
   if (!isFinite(l)) return null;
   const pad = 5;
   return rectToPagePct({ left: l, top: t, right: r, bottom: b }, p, pad);
+}
+
+function blockRects(pageDiv, src, anchorEl = null, point = null) {
+  if (!anchorEl && !point) {
+    const hitboxRects = hitboxRectsForSource(pageDiv, src);
+    if (hitboxRects.length > 1) return hitboxRects;
+  }
+  const rect = blockRect(pageDiv, src, anchorEl, point);
+  return rect ? [rect] : [];
+}
+
+function hitboxRectsForSource(pageDiv, src) {
+  const p = pageDiv.getBoundingClientRect();
+  return [...pageDiv.querySelectorAll(`.hitbox[data-src="${src}"]`)]
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .filter(({ rect }) => rect.width !== 0 || rect.height !== 0)
+    .sort((a, b) => {
+      const colA = Number(a.el.getAttribute('data-column'));
+      const colB = Number(b.el.getAttribute('data-column'));
+      if (Number.isFinite(colA) && Number.isFinite(colB) && colA !== colB) return colA - colB;
+      return a.rect.top - b.rect.top || a.rect.left - b.rect.left;
+    })
+    .map(({ rect }) => rectToPagePct(rect, p, 0));
 }
 
 function rectToPagePct(rect, pageRect, pad = 0) {
@@ -5131,28 +5201,53 @@ function columnSplitFromStarts(starts, pageWidth) {
 
 function highlightSelectedPreviewBlock(src = selectedWordBlockId, { scroll = false } = {}) {
   if (!src) {
-    selectedPreviewBox.style.display = 'none';
+    hideSelectedPreviewBoxes();
     return;
   }
   const pageDiv = [...document.querySelectorAll('.page')].find((page) => page.querySelector(`[data-src="${src}"]`));
   if (!pageDiv) {
-    selectedPreviewBox.style.display = 'none';
+    hideSelectedPreviewBoxes();
     return;
   }
-  const rect = blockRect(pageDiv, src);
-  if (!rect) {
-    selectedPreviewBox.style.display = 'none';
+  const rects = blockRects(pageDiv, src);
+  if (!rects.length) {
+    hideSelectedPreviewBoxes();
     return;
   }
-  if (selectedPreviewBox.parentElement !== pageDiv) pageDiv.appendChild(selectedPreviewBox);
-  Object.assign(selectedPreviewBox.style, {
-    display: 'block',
-    left: rect.left + '%',
-    top: rect.top + '%',
-    width: rect.width + '%',
-    height: rect.height + '%',
-  });
+  placeSelectedPreviewBoxes(pageDiv, rects);
   if (scroll) pageDiv.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+}
+
+function selectedPreviewBoxAt(index) {
+  if (index === 0) return selectedPreviewBox;
+  while (extraSelectedPreviewBoxes.length < index) {
+    const box = document.createElement('div');
+    box.className = 'selected-preview-box';
+    extraSelectedPreviewBoxes.push(box);
+  }
+  return extraSelectedPreviewBoxes[index - 1];
+}
+
+function hideSelectedPreviewBoxes() {
+  selectedPreviewBox.style.display = 'none';
+  for (const box of extraSelectedPreviewBoxes) box.style.display = 'none';
+}
+
+function placeSelectedPreviewBoxes(pageDiv, rects) {
+  for (let i = 0; i < rects.length; i++) {
+    const box = selectedPreviewBoxAt(i);
+    if (box.parentElement !== pageDiv) pageDiv.appendChild(box);
+    Object.assign(box.style, {
+      display: 'block',
+      left: rects[i].left + '%',
+      top: rects[i].top + '%',
+      width: rects[i].width + '%',
+      height: rects[i].height + '%',
+    });
+  }
+  for (let i = rects.length; i <= extraSelectedPreviewBoxes.length; i++) {
+    selectedPreviewBoxAt(i).style.display = 'none';
+  }
 }
 
 pagesEl.addEventListener('mousemove', (ev) => {

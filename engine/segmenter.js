@@ -4,10 +4,11 @@
 // whole pipeline. A block is a paragraph, a heading, a display-math span, or
 // an entire environment. Boundaries are:
 //   - blank lines at group/environment depth 0
-//   - lines starting with \section / \subsection / \begin{...} / \[  (depth 0)
+//   - lines starting with a heading command / \begin{...} / \[  (depth 0)
 //   - the line where an environment or display math closes
 //
-// Blank lines *inside* an environment or display math do not split.
+// Blank lines *inside* an environment, display math, or command optional
+// argument do not split.
 //
 // segmentBody() is a linear scan over the body text — trivial arithmetic per
 // keystroke. Everything expensive downstream (expansion, semantics, layout)
@@ -15,13 +16,17 @@
 
 import { fnv1a } from './hash.js';
 
-const FORCED_START = /^\s*(\\section\b|\\subsection\b|\\begin\{|\\\[)/;
+const HEADING_PATTERN = String.raw`\\(?:part|chapter|section|subsection|subsubsection)\b`;
+const HEADING_START = new RegExp(`^\\s*${HEADING_PATTERN}`);
+const FORCED_START = new RegExp(`^\\s*(?:${HEADING_PATTERN}|\\\\begin\\{|\\\\\\[)`);
+const LABEL_START = /^\s*\\label\b/;
 
 export function segmentBody(text, baseOffset) {
   const segs = [];
   const lines = splitLines(text);
   let envDepth = 0;
   let braceDepth = 0;
+  let bracketDepth = 0;
   let inDisplay = false;
   let cur = null; // { start, end }
 
@@ -35,15 +40,18 @@ export function segmentBody(text, baseOffset) {
     }
   };
 
-  for (const ln of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const ln = lines[lineIndex];
     const stripped = stripComment(ln.text);
+    const nextStripped = lines[lineIndex + 1] ? stripComment(lines[lineIndex + 1].text) : '';
     const blank = stripped.trim().length === 0 && ln.text.trim().length === 0;
-    const atTop = envDepth === 0 && braceDepth <= 0 && !inDisplay;
+    const atTop = envDepth === 0 && braceDepth <= 0 && bracketDepth <= 0 && !inDisplay;
 
     if (blank && atTop) {
       flush(ln.start);
       continue;
     }
+    const headingStart = atTop && HEADING_START.test(stripped);
     if (atTop && cur !== null && FORCED_START.test(stripped)) {
       flush(ln.start);
     }
@@ -57,9 +65,19 @@ export function segmentBody(text, baseOffset) {
     if (/\\\]/.test(stripped)) inDisplay = false;
     braceDepth += braceDelta(stripped);
     if (braceDepth < 0) braceDepth = 0;
+    bracketDepth += bracketDelta(stripped);
+    if (bracketDepth < 0) bracketDepth = 0;
 
     // Environment / display math closed on this line at depth 0: block ends here.
-    if (cur !== null && envDepth === 0 && !inDisplay && braceDepth <= 0) {
+    if (cur !== null && envDepth === 0 && !inDisplay && braceDepth <= 0 && bracketDepth <= 0) {
+      if (headingStart && !LABEL_START.test(nextStripped)) {
+        flush(ln.end);
+        continue;
+      }
+      if (!headingStart && LABEL_START.test(stripped)) {
+        flush(ln.end);
+        continue;
+      }
       if (/\\end\{[^}]*\}\s*$/.test(stripped) || /\\\]\s*$/.test(stripped)) {
         flush(ln.end);
       }
@@ -207,6 +225,17 @@ function braceDelta(s) {
     const c = s[i];
     if ((c === '{' || c === '}') && (i === 0 || s[i - 1] !== '\\')) {
       d += c === '{' ? 1 : -1;
+    }
+  }
+  return d;
+}
+
+function bracketDelta(s) {
+  let d = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if ((c === '[' || c === ']') && (i === 0 || s[i - 1] !== '\\')) {
+      d += c === '[' ? 1 : -1;
     }
   }
   return d;

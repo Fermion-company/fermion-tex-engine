@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { TDOMEngine } from '../engine/engine.js';
+import { segmentBody } from '../engine/segmenter.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo.tex', import.meta.url)), 'utf8');
 
@@ -24,6 +25,64 @@ test('open builds the full DOM and multiple pages', () => {
   assert.equal(dom.labels['sec:intro'], '1');
   assert.equal(dom.labels['sec:pipeline'], '2');
   assert.ok(dom.macros.term);
+});
+
+test('heading commands are standalone edit blocks', () => {
+  const body = [
+    '\\part{Volume}',
+    'Volume preface.',
+    '\\chapter{Chapter One}',
+    'Chapter opener.',
+    '\\section{Section One}',
+    'Section paragraph.',
+    '\\subsection{Subsection One}',
+    'Subsection paragraph.',
+    '\\subsubsection{Subsubsection One}',
+    'Subsubsection paragraph.',
+  ].join('\n');
+  const blocks = segmentBody(body, 0).map((s) => s.text.trim());
+  assert.deepEqual(blocks, [
+    '\\part{Volume}',
+    'Volume preface.',
+    '\\chapter{Chapter One}',
+    'Chapter opener.',
+    '\\section{Section One}',
+    'Section paragraph.',
+    '\\subsection{Subsection One}',
+    'Subsection paragraph.',
+    '\\subsubsection{Subsubsection One}',
+    'Subsubsection paragraph.',
+  ]);
+});
+
+test('headings inside command optional arguments stay with their owner block', () => {
+  const body = [
+    '\\twocolumn[',
+    '\\section{Top Matter}',
+    'Top matter belongs to the optional argument.',
+    ']',
+    '\\section{Main Matter}',
+    'Main text is a separate block.',
+  ].join('\n');
+  const blocks = segmentBody(body, 0).map((s) => s.text.trim());
+  assert.deepEqual(blocks, [
+    '\\twocolumn[\n\\section{Top Matter}\nTop matter belongs to the optional argument.\n]',
+    '\\section{Main Matter}',
+    'Main text is a separate block.',
+  ]);
+});
+
+test('heading blocks keep an immediate label but split before body text', () => {
+  const body = [
+    '\\section{Labeled}',
+    '\\label{sec:labeled}',
+    'The body is still its own edit block.',
+  ].join('\n');
+  const blocks = segmentBody(body, 0).map((s) => s.text.trim());
+  assert.deepEqual(blocks, [
+    '\\section{Labeled}\n\\label{sec:labeled}',
+    'The body is still its own edit block.',
+  ]);
 });
 
 test('single word edit dirties exactly one block and patches only its page(s)', () => {

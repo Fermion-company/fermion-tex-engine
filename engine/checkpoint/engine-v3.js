@@ -38,7 +38,7 @@ const BASE_COUNTERS = [
   'part', 'section', 'subsection', 'subsubsection', 'paragraph',
   'equation', 'figure', 'table', 'footnote',
 ];
-const HEADING_RE = /^\s*\\(section|subsection|subsubsection|paragraph)\b/;
+const HEADING_RE = /^\s*\\(part|chapter|section|subsection|subsubsection|paragraph)\b/;
 const JOB_TIMEOUT = 30_000;
 const BOOT_TIMEOUT = 60_000;
 
@@ -167,10 +167,11 @@ export class CheckpointEngine {
       blocks: this.blocks.map((b, i) => {
         const floatGfxChunks = (b.galley?.floats ?? []).filter((f) => f.gfx).map((f) => `${b.id}#${f.n}`);
         const gfxChunks = [...(b.gfx ? [b.id] : []), ...floatGfxChunks];
+        const type = b.kind ?? (HEADING_RE.test(b.text) ? 'heading' : 'block');
         return {
           id: b.id,
           index: i,
-          type: b.kind ?? 'block',
+          type,
           gfx: gfxChunks.length > 0,
           gfxChunks,
           source: {
@@ -205,6 +206,118 @@ export class CheckpointEngine {
     const pdf = path.join(this.workDir, 'export.pdf');
     if (!existsSync(pdf)) throw new Error('full compile failed');
     return readFileSync(pdf);
+  }
+
+  async buildNativePageLayoutPoc({ text = this.getSource(), jobTag = 'sync' } = {}) {
+    await this.#ensureShim();
+    const safeTag = String(jobTag).replace(/[^0-9A-Za-z_-]+/g, '_');
+    const jobdir = path.join(this.workDir, `page-layout-poc-${safeTag}`);
+    rmSync(jobdir, { recursive: true, force: true });
+    mkdirSync(jobdir, { recursive: true });
+
+    const bounds = documentBounds(text);
+    const segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
+    const liveIds = new Map(
+      this.blocks.map((b) => [`${b.start}:${b.end}:${b.hash}`, b.id])
+    );
+    const blocks = segs.map((s, i) => ({
+      id: liveIds.get(`${s.start}:${s.end}:${s.hash}`) ?? `poc${i + 1}`,
+      index: i,
+      start: s.start,
+      end: s.end,
+      text: s.text,
+      hash: s.hash,
+    }));
+
+    const lua = path.join(jobdir, 'page-layout-poc.lua');
+    const meta = path.join(jobdir, 'page-layout-poc.json');
+    const tex = path.join(jobdir, 'page-layout-poc.tex');
+    writeFileSync(lua, pageLayoutPocLuaSource(), 'utf8');
+    writeFileSync(
+      tex,
+      instrumentPageLayoutPocSource(
+        text,
+        bounds,
+        blocks,
+        lua,
+        meta,
+        [
+          ...BASE_COUNTERS,
+          ...scanCounterDefs(text.slice(bounds.preamble.start, bounds.preamble.end)),
+        ],
+        path.join(this.workDir, 'tdomfork.so')
+      ),
+      'utf8'
+    );
+
+    const repoRoot = path.resolve(DIR, '..', '..');
+    const env = {
+      ...process.env,
+      TEXINPUTS: `${this.docDir}//:${this.workDir}//:${jobdir}//:${repoRoot}//:${process.env.TEXINPUTS || ''}`,
+      LUAINPUTS: `${this.docDir}//:${this.workDir}//:${jobdir}//:${repoRoot}//:${process.env.LUAINPUTS || ''}`,
+    };
+    const args = [
+      '--shell-escape',
+      '-interaction=nonstopmode',
+      '-halt-on-error',
+      '-synctex=1',
+      '-output-directory',
+      jobdir,
+      tex,
+    ];
+    const run = () =>
+      execFileP('lualatex', args, {
+        cwd: this.docDir,
+        timeout: 120_000,
+        maxBuffer: 30 * 1024 * 1024,
+        env,
+      });
+    try {
+      await run();
+      await run();
+    } catch (err) {
+      let log = '';
+      try { log = readFileSync(path.join(jobdir, 'page-layout-poc.log'), 'utf8'); } catch { /* no log */ }
+      throw new Error(`native page-layout PoC failed — ${texErrorFrom(log) || err.message}`);
+    }
+    if (!existsSync(meta)) throw new Error('native page-layout PoC produced no page metadata');
+
+    const raw = JSON.parse(readFileSync(meta, 'utf8'));
+    const pages = raw.pages ?? [];
+    const pagesByBlock = new Map(blocks.map((b) => [b.id, []]));
+    for (const page of pages) {
+      for (const id of page.blockIds ?? []) {
+        if (!pagesByBlock.has(id)) pagesByBlock.set(id, []);
+        const arr = pagesByBlock.get(id);
+        if (arr[arr.length - 1] !== page.number) arr.push(page.number);
+      }
+    }
+    const pdf = path.join(jobdir, 'page-layout-poc.pdf');
+    const synctex = path.join(jobdir, 'page-layout-poc.synctex.gz');
+    return {
+      engine: 'lualatex',
+      mode: 'normal-tex-pre-shipout-callback',
+      normalTex: true,
+      texFile: tex,
+      pdf: existsSync(pdf) ? pdf : null,
+      synctex: existsSync(synctex) ? synctex : null,
+      pageCount: pages.length,
+      blocks: blocks.map((b) => ({
+        id: b.id,
+        index: b.index,
+        start: b.start,
+        end: b.end,
+        pages: pagesByBlock.get(b.id) ?? [],
+      })),
+      pages,
+      stats: {
+        compilePasses: 2,
+        blocks: blocks.length,
+        pages: pages.length,
+        blocksWithPages: [...pagesByBlock.values()].filter((v) => v.length > 0).length,
+        glyphs: pages.reduce((n, p) => n + (p.glyphs?.length ?? 0), 0),
+      },
+    };
   }
 
   // ---------------------------------------------------------- root/daemon
@@ -726,7 +839,7 @@ export class CheckpointEngine {
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
-    const earlyFullPagePreview = fullPagePreviewReason(text);
+    const earlyFullPagePreview = editLabel === 'open' ? fullPagePreviewReason(text) : '';
     if (earlyFullPagePreview) {
       let pages;
       let reused = 0;
@@ -977,19 +1090,11 @@ export class CheckpointEngine {
       }
     }
     if (!pages) {
-      if (fullPagePreview && deferFullPagePreview && this.fullPagePreviewActive) {
-        pages = this.pages;
-        reused = pages.length;
-        rebuilt = 0;
+      pagesRaw = this.#paginateNow();
+      ({ pages, reused, rebuilt } = reconcile(pagesRaw, this.pages));
+      if (fullPagePreview && deferFullPagePreview) {
         fullPagePreviewPending = true;
-        diagnostics.push(`full-page exact preview queued: ${fullPagePreview}`);
-      } else {
-        pagesRaw = this.#paginateNow();
-        ({ pages, reused, rebuilt } = reconcile(pagesRaw, this.pages));
-        if (fullPagePreview && deferFullPagePreview) {
-          fullPagePreviewPending = true;
-          diagnostics.push(`full-page exact preview queued: ${fullPagePreview}`);
-        }
+        diagnostics.push(`full-page live preview patched; exact preview queued: ${fullPagePreview}`);
       }
     }
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
@@ -1457,29 +1562,80 @@ export class CheckpointEngine {
     });
     const pageWords = parsePdfBboxWords(stdout);
     const out = new Map();
+    const termsByBlock = new Map();
+    const termBlocks = new Map();
     for (const block of this.blocks) {
       const terms = significantTerms(block.text);
-      if (!terms.size) continue;
-      const isWideBlock = /\\begin\s*\{(?:multicols\*?|paracol\*?)\}/.test(block.text);
+      termsByBlock.set(block, terms);
+      for (const term of terms) {
+        if (!termBlocks.has(term)) termBlocks.set(term, new Set());
+        termBlocks.get(term).add(block.id);
+      }
+    }
+    const lastPageNo = Math.max(1, ...pageWords.map((p) => p.n));
+    let minCandidatePage = 1;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const block = this.blocks[i];
+      const nextBlockForcesPageBreak = forcesFullPageBreak(this.blocks[i + 1]?.text ?? '');
+      const maxCandidatePage = nextBlockForcesPageBreak ? minCandidatePage : lastPageNo;
+      const allTerms = termsByBlock.get(block) ?? new Set();
+      const uniqueTerms = new Set([...allTerms].filter((term) => (termBlocks.get(term)?.size ?? 0) === 1));
+      const columnInfo = columnLayoutBlockInfo(block.text);
+      const terms = uniqueTerms.size ? uniqueTerms : (columnInfo ? allTerms : new Set());
+      if (!terms.size) {
+        if (forcesFullPageBreak(block.text)) minCandidatePage = Math.min(lastPageNo, minCandidatePage + 1);
+        continue;
+      }
+      const isWideBlock = columnInfo != null || /\\begin\s*\{paracol\*?\}/.test(block.text);
       for (const page of pageWords) {
+        if (page.n < minCandidatePage) continue;
+        if (page.n > maxCandidatePage) continue;
+        if (uniqueTerms.size) {
+          const uniqueMatches = page.words.filter((w) => uniqueTerms.has(w.n));
+          if (!uniqueMatches.length) continue;
+        }
         const matches = page.words.filter((w) => terms.has(w.n));
-        const minMatches = isWideBlock ? 8 : Math.min(4, Math.max(2, terms.size));
+        const minMatches = isWideBlock
+          ? Math.min(8, Math.max(2, terms.size))
+          : uniqueTerms.size >= 1
+            ? 1
+            : Math.min(4, Math.max(2, terms.size));
         if (matches.length < minMatches) continue;
-        const rect = rectForWords(matches, {
+        if (!out.has(page.n)) out.set(page.n, []);
+        // Full-page exact previews are images, so editable regions must be
+        // reconstructed from PDF word boxes. Multi-column blocks need several
+        // tight column/paragraph boxes; a single union rectangle becomes a
+        // page-sized blue outline around unrelated columns and gaps.
+        if (columnInfo && matches.length >= columnInfo.cols * 2) {
+          for (const box of columnRectsForWords(matches, columnInfo.cols, pageW, pageH)) {
+            out.get(page.n).push({
+              src: block.id,
+              layout: columnInfo.layout,
+              column: box.col,
+              x: r2(box.x),
+              y: r2(box.y),
+              w: r2(box.w),
+              h: r2(box.h),
+            });
+          }
+          continue;
+        }
+        const rects = rectsForWords(matches, {
           trimOutliers: isWideBlock && matches.length > 20,
           pageW,
           pageH,
         });
-        if (!rect) continue;
-        if (!out.has(page.n)) out.set(page.n, []);
-        out.get(page.n).push({
-          src: block.id,
-          x: r2(rect.x),
-          y: r2(rect.y),
-          w: r2(rect.w),
-          h: r2(rect.h),
-        });
+        for (const rect of rects) {
+          out.get(page.n).push({
+            src: block.id,
+            x: r2(rect.x),
+            y: r2(rect.y),
+            w: r2(rect.w),
+            h: r2(rect.h),
+          });
+        }
       }
+      if (forcesFullPageBreak(block.text)) minCandidatePage = Math.min(lastPageNo, minCandidatePage + 1);
     }
     return out;
   }
@@ -1959,6 +2115,12 @@ function scanCounterDefs(preamble) {
 }
 
 function fullPagePreviewReason(text) {
+  // Balancing multicols (non-starred) with 4+ columns deterministically crashes
+  // the resident TeX daemon for some column/body-length combinations, so route
+  // it to the exact full-page image. multicols* (no balancing) is stable on the
+  // resident path and keeps its editable glyph layout. The full-page path still
+  // synthesizes per-column edit hitboxes (see #fullPageHitboxes), so the exact
+  // fallback is not read-only.
   for (const multicol of text.matchAll(/\\begin\s*\{multicols\}\s*\{(\d+)\}/g)) {
     if ((Number(multicol[1]) || 0) >= 4) return 'multicols environment with 4+ columns';
   }
@@ -1972,6 +2134,24 @@ function multicolBlockInfo(text) {
   const m = text.match(/\\begin\s*\{(multicols\*?)\}\s*\{(\d+)\}/);
   if (!m) return null;
   return { cols: Math.max(2, Math.min(20, Number(m[2]) || 2)), starred: m[1].endsWith('*') };
+}
+
+function paracolBlockInfo(text) {
+  const m = text.match(/\\begin\s*\{paracol\*?\}\s*\{(\d+)\}/);
+  if (!m) return null;
+  return { cols: Math.max(2, Math.min(20, Number(m[1]) || 2)) };
+}
+
+function columnLayoutBlockInfo(text) {
+  const mc = multicolBlockInfo(text);
+  if (mc) return { layout: 'multicol', cols: mc.cols };
+  const pc = paracolBlockInfo(text);
+  if (pc) return { layout: 'paracol', cols: pc.cols };
+  return null;
+}
+
+function forcesFullPageBreak(text) {
+  return /\\(?:clearpage|cleardoublepage|onecolumn|twocolumn)\b/.test(text);
 }
 
 function dimBp(v) {
@@ -2097,6 +2277,376 @@ function rectForWords(words, { trimOutliers = false, pageW = 612, pageH = 792 } 
   const y1 = Math.min(pageH, Math.max(...use.map((w) => w.y1)) + pad);
   if (x1 <= x0 || y1 <= y0) return null;
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+function rectsForWords(words, opts = {}) {
+  if (!words.length) return [];
+  const rects = verticalWordClusters(words)
+    .map((cluster) => rectForWords(cluster.words, opts))
+    .filter(Boolean);
+  if (rects.length) return rects;
+  const rect = rectForWords(words, opts);
+  return rect ? [rect] : [];
+}
+
+// Group full-page bbox words into per-column/paragraph boxes. The words' own
+// horizontal span is divided into `cols` bands and each word is assigned to the
+// band under its center. Within a column, large vertical gaps start a new box
+// so the preview does not draw one huge blue outline across unrelated text.
+function columnRectsForWords(words, cols, pageW = 612, pageH = 792) {
+  if (!(cols >= 1) || !words.length) return [];
+  const minX = Math.min(...words.map((w) => w.x0));
+  const maxX = Math.max(...words.map((w) => w.x1));
+  const span = maxX - minX;
+  if (!(span > 0)) return [];
+  const bandW = span / cols;
+  const byCol = new Map();
+  for (const w of words) {
+    const cx = (w.x0 + w.x1) / 2;
+    const col = Math.max(0, Math.min(cols - 1, Math.floor((cx - minX) / bandW)));
+    if (!byCol.has(col)) byCol.set(col, []);
+    byCol.get(col).push(w);
+  }
+  const pad = 4;
+  const out = [];
+  for (const [col, colWords] of [...byCol].sort((a, b) => a[0] - b[0])) {
+    for (const r of verticalWordClusters(colWords)) {
+      const x = Math.max(0, r.x0 - pad);
+      const y = Math.max(0, r.y0 - pad);
+      const x1 = Math.min(pageW, r.x1 + pad);
+      const y1 = Math.min(pageH, r.y1 + pad);
+      if (x1 <= x || y1 <= y) continue;
+      out.push({ col, x, y, w: x1 - x, h: y1 - y });
+    }
+  }
+  return out;
+}
+
+function verticalWordClusters(words) {
+  const sorted = [...words].sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+  const clusters = [];
+  let cur = null;
+  let lastY1 = -Infinity;
+  for (const w of sorted) {
+    const lineH = Math.max(4, w.y1 - w.y0);
+    const gap = w.y0 - lastY1;
+    if (!cur || gap > Math.max(18, lineH * 1.9)) {
+      cur = { x0: w.x0, y0: w.y0, x1: w.x1, y1: w.y1, count: 0, words: [] };
+      clusters.push(cur);
+    } else {
+      cur.x0 = Math.min(cur.x0, w.x0);
+      cur.y0 = Math.min(cur.y0, w.y0);
+      cur.x1 = Math.max(cur.x1, w.x1);
+      cur.y1 = Math.max(cur.y1, w.y1);
+    }
+    cur.count++;
+    cur.words.push(w);
+    lastY1 = Math.max(lastY1, w.y1);
+  }
+  return clusters.filter((r) => r.count >= 2);
+}
+
+function instrumentPageLayoutPocSource(text, bounds, blocks, luaPath, metaPath, counters, shimPath) {
+  let cursor = bounds.body.start;
+  const body = [];
+  for (const block of blocks) {
+    body.push(text.slice(cursor, block.start));
+    body.push(`\n\\directlua{tdom_poc_register_block('${luaStr(block.id)}',${block.index},${block.start},${block.end})}\n`);
+    body.push(`\\special{tdom:poc:start:${block.id}}\n`);
+    body.push(block.text);
+    body.push(`\n\\special{tdom:poc:end:${block.id}}\n`);
+    cursor = block.end;
+  }
+  body.push(text.slice(cursor, bounds.body.end));
+  const setup =
+    `\n\\directlua{dofile('${luaStr(luaPath)}');tdom_poc_setup('${luaStr(metaPath)}',{` +
+    counters.map((c) => `'${luaStr(c)}'`).join(',') +
+    `},'${luaStr(shimPath)}')}\n`;
+  return text.slice(0, bounds.body.start) + setup + body.join('') + text.slice(bounds.body.end);
+}
+
+function pageLayoutPocLuaSource() {
+  return String.raw`
+local OUT = nil
+local COUNTERS = {}
+local fk = nil
+local pages = {}
+local blocks = {}
+local active_block = nil
+local current_page = nil
+local page_block_seen = nil
+
+local SP2BP = 65781.76
+local function bp(sp)
+  return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1000000
+end
+
+local function jstr(s)
+  s = tostring(s or '')
+  s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', ''):gsub('\t', '\\t')
+  s = s:gsub('[%z\1-\31]', '')
+  return '"' .. s .. '"'
+end
+
+local function jenc(v)
+  local t = type(v)
+  if t == 'number' then
+    if v ~= v or v == math.huge or v == -math.huge then return '0' end
+    return string.format('%.10g', v)
+  elseif t == 'boolean' then
+    return tostring(v)
+  elseif t == 'string' then
+    return jstr(v)
+  elseif t == 'table' then
+    if v[1] ~= nil or next(v) == nil then
+      local parts = {}
+      for i = 1, #v do parts[#parts + 1] = jenc(v[i]) end
+      return '[' .. table.concat(parts, ',') .. ']'
+    else
+      local parts = {}
+      for k, val in pairs(v) do parts[#parts + 1] = jstr(k) .. ':' .. jenc(val) end
+      return '{' .. table.concat(parts, ',') .. '}'
+    end
+  end
+  return 'null'
+end
+
+function tdom_poc_register_block(id, index, start_offset, end_offset)
+  blocks[id] = {
+    id = id,
+    index = tonumber(index) or 0,
+    start = tonumber(start_offset) or 0,
+    stop = tonumber(end_offset) or 0,
+  }
+end
+
+local GLYPH = node.id('glyph')
+local HLIST = node.id('hlist')
+local VLIST = node.id('vlist')
+local RULE = node.id('rule')
+local GLUE = node.id('glue')
+local KERN = node.id('kern')
+local DISC = node.id('disc')
+local WHATSIT = node.id('whatsit')
+local SPECIAL_SUB = node.subtype and node.subtype('special')
+
+local function note_block(id)
+  if not id or not current_page then return end
+  if not page_block_seen[id] then
+    page_block_seen[id] = true
+    current_page.blockIds[#current_page.blockIds + 1] = id
+  end
+end
+
+local function check_marker(n)
+  if not (n and WHATSIT and SPECIAL_SUB and n.id == WHATSIT and n.subtype == SPECIAL_SUB and n.data) then
+    return false
+  end
+  local start_id = n.data:match('^tdom:poc:start:([%w_%-]+)$')
+  if start_id then
+    active_block = start_id
+    note_block(active_block)
+    return true
+  end
+  local end_id = n.data:match('^tdom:poc:end:([%w_%-]+)$')
+  if end_id then
+    note_block(end_id)
+    if active_block == end_id then active_block = nil end
+    return true
+  end
+  return false
+end
+
+local walk_h, walk_v
+
+local function emit_glyph(n, x, baseline)
+  local ch = '?'
+  local ok, s = pcall(function() return unicode.utf8.char(n.char or 63) end)
+  if ok and s then ch = s end
+  local f = font.getfont(n.font or 0) or {}
+  local block = active_block
+  if block then note_block(block) end
+  current_page.glyphs[#current_page.glyphs + 1] = {
+    block = block or '',
+    text = ch,
+    x = bp(x + (n.xoffset or 0)),
+    y = bp(baseline - (n.yoffset or 0)),
+    font = f.name or f.fullname or '',
+    size = bp(f.size or 0),
+  }
+end
+
+walk_h = function(head, parent, x0, baseline)
+  local x = x0
+  local n = head
+  while n do
+    local id = n.id
+    if id == GLYPH then
+      emit_glyph(n, x, baseline)
+      x = x + (n.width or 0)
+    elseif id == KERN then
+      x = x + (n.kern or 0)
+    elseif id == GLUE then
+      x = x + (node.effective_glue(n, parent) or n.width or 0)
+    elseif id == HLIST then
+      walk_h(n.list, n, x, baseline + (n.shift or 0))
+      x = x + (n.width or 0)
+    elseif id == VLIST then
+      walk_v(n, x, baseline + (n.shift or 0))
+      x = x + (n.width or 0)
+    elseif id == DISC then
+      if n.replace then
+        local fake = node.hpack(node.copy_list(n.replace))
+        walk_h(fake.list, fake, x, baseline)
+        x = x + (fake.width or 0)
+        node.free(fake)
+      end
+    elseif id == WHATSIT then
+      check_marker(n)
+    elseif id == RULE then
+      x = x + (n.width or 0)
+    end
+    n = n.next
+  end
+end
+
+walk_v = function(box, x0, baseline)
+  local y = baseline - (box.height or 0)
+  local n = box.list
+  while n do
+    local id = n.id
+    if id == HLIST then
+      local base = y + (n.height or 0)
+      walk_h(n.list, n, x0 + (n.shift or 0), base)
+      y = y + (n.height or 0) + (n.depth or 0)
+    elseif id == VLIST then
+      walk_v(n, x0 + (n.shift or 0), y + (n.height or 0))
+      y = y + (n.height or 0) + (n.depth or 0)
+    elseif id == GLUE then
+      y = y + (node.effective_glue(n, box) or n.width or 0)
+    elseif id == KERN then
+      y = y + (n.kern or 0)
+    elseif id == RULE then
+      y = y + (n.height or 0) + (n.depth or 0)
+    elseif id == WHATSIT then
+      check_marker(n)
+    end
+    n = n.next
+  end
+end
+
+local function counter_value(name)
+  local ok, v = pcall(function() return tex.count['c@' .. name] end)
+  if ok and v ~= nil then return tonumber(v) or 0 end
+  return nil
+end
+
+local function collect_state()
+  local state = {
+    shipoutIndex = #pages + 1,
+    outputpenalty = tonumber(tex.outputpenalty or 0) or 0,
+    pagetotal = bp(tex.pagetotal or 0),
+    pagegoal = bp(tex.pagegoal or 0),
+    deadcycles = tonumber(tex.deadcycles or 0) or 0,
+    counters = {},
+  }
+  state.pageCounter = counter_value('page')
+  for _, name in ipairs(COUNTERS) do
+    local v = counter_value(name)
+    if v ~= nil then state.counters[name] = v end
+  end
+  if fk then
+    local ok, pid = pcall(function() return fk.fork() end)
+    if ok and pid == 0 then
+      fk._exit(0)
+    elseif ok and pid then
+      state.processSnapshot = { method = 'fork', pid = pid }
+    else
+      state.processSnapshot = { method = 'fork', error = tostring(pid) }
+    end
+  else
+    state.processSnapshot = { method = 'unavailable' }
+  end
+  return state
+end
+
+local function block_range(ids)
+  local first, last = nil, nil
+  for _, id in ipairs(ids) do
+    local b = blocks[id]
+    if b then
+      first = first and math.min(first, b.index) or b.index
+      last = last and math.max(last, b.index) or b.index
+    end
+  end
+  return { first = first or -1, last = last or -1 }
+end
+
+local function tdom_poc_shipout(head)
+  current_page = {
+    number = #pages + 1,
+    state = collect_state(),
+    blockIds = {},
+    blockRange = { first = -1, last = -1 },
+    glyphs = {},
+  }
+  page_block_seen = {}
+  if active_block then note_block(active_block) end
+  if head and (head.id == HLIST or head.id == VLIST) then
+    walk_v(head, 0, head.height or 0)
+  end
+  table.sort(current_page.blockIds, function(a, b)
+    local ai = blocks[a] and blocks[a].index or 0
+    local bi = blocks[b] and blocks[b].index or 0
+    return ai < bi
+  end)
+  current_page.blockRange = block_range(current_page.blockIds)
+  pages[#pages + 1] = current_page
+  current_page = nil
+  page_block_seen = nil
+  return head
+end
+
+local function tdom_poc_finish()
+  local ordered = {}
+  for _, b in pairs(blocks) do
+    ordered[#ordered + 1] = {
+      id = b.id,
+      index = b.index,
+      start = b.start,
+      stop = b.stop,
+    }
+  end
+  table.sort(ordered, function(a, b) return (a.index or 0) < (b.index or 0) end)
+  local f = assert(io.open(OUT, 'w'))
+  f:write(jenc({
+    mode = 'normal-tex-pre-shipout-callback',
+    normalTex = true,
+    blocks = ordered,
+    pages = pages,
+  }))
+  f:close()
+end
+
+function tdom_poc_setup(out, counters, shim_path)
+  OUT = out
+  COUNTERS = counters or {}
+  if shim_path and shim_path ~= '' then
+    local loader = package.loadlib(shim_path, 'luaopen_tdomfork')
+    if loader then
+      fk = loader()
+      pcall(function() fk.ignore_sigchld() end)
+    end
+  end
+  if luatexbase and luatexbase.add_to_callback then
+    luatexbase.add_to_callback('pre_shipout_filter', tdom_poc_shipout, 'tdom page-layout poc')
+    luatexbase.add_to_callback('finish_pdffile', tdom_poc_finish, 'tdom page-layout poc finish')
+  else
+    callback.register('pre_shipout_filter', tdom_poc_shipout)
+    callback.register('finish_pdffile', tdom_poc_finish)
+  end
+end
+`;
 }
 
 function normWord(s) {
