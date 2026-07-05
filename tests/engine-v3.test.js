@@ -245,3 +245,87 @@ This paragraph is after the environment and should return to normal width.
   );
   assert.notEqual(JSON.stringify(eng.getDisplayLists().map((p) => p.hash)), beforeEditHash);
 });
+
+test('multicols variants handle three or more columns', opts, async () => {
+  const makeTex = (env, cols, paragraphs) => {
+    const body = Array.from(
+      { length: paragraphs },
+      (_, i) =>
+        `Paragraph ${i + 1}. ` +
+        'This text exercises multi column layout with enough material to wrap across columns and pages. '.repeat(3)
+    ).join('\n\n');
+    return String.raw`\documentclass{article}
+\usepackage[a4paper,margin=18mm]{geometry}
+\usepackage{multicol}
+\begin{document}
+A normal paragraph before the multi-column region.
+
+\begin{` + env + String.raw`}{` + cols + String.raw`}
+\section{Column Probe}
+` + body + String.raw`
+\end{` + env + String.raw`}
+
+A normal paragraph after the multi-column region.
+\end{document}`;
+  };
+
+  const specs = [
+    { env: 'multicols', cols: 3, paragraphs: 32, exact: false },
+    { env: 'multicols', cols: 4, paragraphs: 38, exact: true },
+    { env: 'multicols*', cols: 3, paragraphs: 32, exact: false },
+    { env: 'multicols*', cols: 4, paragraphs: 38, exact: false },
+  ];
+  for (const spec of specs) {
+    const report = await eng.open(makeTex(spec.env, spec.cols, spec.paragraphs));
+    assert.equal(report.stats.fullPagePreview, spec.exact, `${spec.env} ${spec.cols} exact-preview choice`);
+    if (spec.exact) {
+      assert.equal(report.stats.fullPagePreviewReason, 'multicols environment with 4+ columns');
+    } else {
+      assert.equal(report.stats.fullPagePreviewReason, '');
+    }
+    const geo = eng.getGeometry();
+    const pages = eng.getDisplayLists();
+    assert.ok(pages.length >= 2, `${spec.env} ${spec.cols} paginates`);
+    const commands = pages.flatMap((p) => p.commands);
+    const hitboxes = commands.filter((c) => c.op === 'hitbox');
+    assert.ok(hitboxes.length > 0, `${spec.env} ${spec.cols} exposes edit hitboxes`);
+    assert.ok(
+      hitboxes.every((c) => c.y >= -0.5 && c.y + c.h <= geo.paperheight + 0.5),
+      `${spec.env} ${spec.cols} hitboxes stay within the visible page`
+    );
+    if (!spec.exact) {
+      const columnHitboxes = commands.filter((c) => c.op === 'hitbox' && c.layout === 'multicol');
+      assert.ok(columnHitboxes.some((c) => c.column === spec.cols - 1), `${spec.env} ${spec.cols} last column hitbox`);
+      assert.ok(commands.some((c) => c.op === 'glyphs' && c.layout === 'multicol'), `${spec.env} ${spec.cols} resident glyphs`);
+    } else {
+      assert.ok(commands.some((c) => c.op === 'chunk'), `${spec.env} ${spec.cols} exact page chunk`);
+    }
+  }
+});
+
+test('full-page preview detection sees later four-column multicols blocks', opts, async () => {
+  const paragraphs = Array.from(
+    { length: 24 },
+    (_, i) =>
+      `Paragraph ${i + 1}. ` +
+      'This text keeps a later four-column multicols block large enough to exercise the exact preview fallback. '.repeat(2)
+  ).join('\n\n');
+  const report = await eng.open(String.raw`\documentclass{article}
+\usepackage[a4paper,margin=18mm]{geometry}
+\usepackage{multicol}
+\begin{document}
+\begin{multicols}{3}
+This earlier three-column block should not hide a later four-column block from the detector.
+\end{multicols}
+
+\begin{multicols}{4}
+${paragraphs}
+\end{multicols}
+\end{document}`);
+
+  assert.equal(report.stats.fullPagePreview, true);
+  assert.equal(report.stats.fullPagePreviewReason, 'multicols environment with 4+ columns');
+  assert.ok(Array.isArray(report.dirtySourceNodes));
+  assert.ok(Array.isArray(report.dirtyDependencies));
+  assert.ok(eng.getDisplayLists().some((p) => p.commands.some((c) => c.op === 'chunk')));
+});

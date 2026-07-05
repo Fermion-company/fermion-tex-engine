@@ -51,6 +51,12 @@ const regionTitleEl = document.getElementById('region-title');
 const regionLabelEl = document.getElementById('region-label');
 const regionBodyEl = document.getElementById('region-body');
 const regionInsertButton = document.getElementById('region-insert');
+const multicolColsEl = document.getElementById('multicol-cols');
+const multicolFlowEl = document.getElementById('multicol-flow');
+const multicolTargetEl = document.getElementById('multicol-target');
+const multicolTitleEl = document.getElementById('multicol-title');
+const multicolBodyEl = document.getElementById('multicol-body');
+const multicolInsertButton = document.getElementById('multicol-insert');
 const codeTitleEl = document.getElementById('code-title');
 const codeTargetEl = document.getElementById('code-target');
 const codeLinesEl = document.getElementById('code-lines');
@@ -743,7 +749,7 @@ function renderInsertTargets(blocks, source) {
         label: `${displayTitleForBlock(block, source)} の後`,
       })),
   ];
-  for (const select of [regionTargetEl, codeTargetEl, imageTargetEl, tableTargetEl, drawTargetEl, aiTargetEl, codeFileTargetEl, codeSplitTargetEl]) {
+  for (const select of [regionTargetEl, multicolTargetEl, codeTargetEl, imageTargetEl, tableTargetEl, drawTargetEl, aiTargetEl, codeFileTargetEl, codeSplitTargetEl]) {
     if (!select) continue;
     const previous = select.value || 'end';
     select.textContent = '';
@@ -2946,6 +2952,27 @@ function insertRegion() {
   setWorkspaceMode('edit');
 }
 
+function buildMulticolTex() {
+  const cols = Math.max(2, Math.min(20, Number(multicolColsEl?.value) || 2));
+  const env = multicolFlowEl?.value === 'continuous' ? 'multicols*' : 'multicols';
+  const title = multicolTitleEl?.value?.trim() || '';
+  const body = multicolBodyEl?.value?.trim() || 'ここに本文を入力します。';
+  const parts = [];
+  if (title) parts.push(`\\section{${title}}`);
+  parts.push(`\\begin{${env}}{${cols}}`);
+  parts.push(body);
+  parts.push(`\\end{${env}}`);
+  return `\n${parts.join('\n')}\n`;
+}
+
+function insertMulticolRegion() {
+  const source = ensurePackage(editor.value, 'multicol');
+  editor.value = insertTexAtTarget(source, buildMulticolTex(), multicolTargetEl?.value || 'end');
+  scheduleSync();
+  statusEl.textContent = '多段組を追加しました';
+  setWorkspaceMode('edit');
+}
+
 function insertCodeBlock() {
   const source = ensurePackage(editor.value, 'kkluaverb');
   editor.value = insertTexAtTarget(source, buildCodeTex(), codeTargetEl?.value || 'end');
@@ -2955,6 +2982,7 @@ function insertCodeBlock() {
 }
 
 regionInsertButton?.addEventListener('click', insertRegion);
+multicolInsertButton?.addEventListener('click', insertMulticolRegion);
 codeInsertButton?.addEventListener('click', insertCodeBlock);
 
 function texFileKind(name, selected = 'auto') {
@@ -6704,6 +6732,9 @@ sse.onmessage = (ev) => {
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {
       applyReport(msg.report);
       renderInspector(msg.report, null);
+      if (msg.report.edit?.startsWith('async full-page preview:')) {
+        statusEl.textContent = `async preview #${msg.report.rev} [${backend}] — exact更新完了`;
+      }
       fetch('/doc')
         .then((r) => r.json())
         .then((doc) => {

@@ -343,6 +343,11 @@ function broadcast(payload) {
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
 if (backend === 'checkpoint') {
   engine.onAsyncPatches = (partial) => {
+    if (partial.report) {
+      lastReport = partial.report;
+      broadcast({ kind: 'update', report: lastReport });
+      return;
+    }
     broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
   };
   engine.onExternalChange = () => {

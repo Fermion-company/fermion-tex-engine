@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fermion TeX Engine</title>
 <link rel="stylesheet" href="/mathlive/mathlive-static.css">
-<link rel="stylesheet" href="/style.css?v=multicol-resident-10">
+<link rel="stylesheet" href="/style.css?v=multicol-ui-13">
 </head>
 <body>
 <header id="topbar">
@@ -118,6 +118,36 @@
           </div>
           <textarea id="region-body" placeholder="追加したい本文または数式を入力" spellcheck="true"></textarea>
           <button id="region-insert" class="primary-action" type="button">編集領域を追加</button>
+        </section>
+        <section class="insert-card">
+          <h3>多段組</h3>
+          <div class="insert-grid">
+            <label>段数
+              <select id="multicol-cols">
+                <option value="2">2段</option>
+                <option value="3" selected>3段</option>
+                <option value="4">4段</option>
+                <option value="5">5段</option>
+                <option value="6">6段</option>
+              </select>
+            </label>
+            <label>流し方
+              <select id="multicol-flow">
+                <option value="balanced" selected>最後の段を揃える</option>
+                <option value="continuous">順に流す</option>
+              </select>
+            </label>
+            <label>追加位置
+              <select id="multicol-target">
+                <option value="end" selected>文末</option>
+              </select>
+            </label>
+            <label>見出し
+              <input id="multicol-title" type="text" placeholder="任意">
+            </label>
+          </div>
+          <textarea id="multicol-body" placeholder="多段組にする本文を入力" spellcheck="true"></textarea>
+          <button id="multicol-insert" class="primary-action" type="button">多段組を追加</button>
         </section>
         <section class="insert-card">
           <h3>コードを貼り付け</h3>
@@ -605,6 +635,6 @@
 </main>
 
 <script src="/mathlive/mathlive.min.js"></script>
-<script src="/app.js?v=multicol-resident-10"></script>
+<script src="/app.js?v=multicol-ui-13"></script>
 </body>
 </html>

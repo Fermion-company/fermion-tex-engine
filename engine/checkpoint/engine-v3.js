@@ -726,6 +726,73 @@ export class CheckpointEngine {
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
+    const earlyFullPagePreview = fullPagePreviewReason(text);
+    if (earlyFullPagePreview) {
+      let pages;
+      let reused = 0;
+      let rebuilt = 0;
+      let fullPagePreviewPending = false;
+      if (editLabel !== 'open' && this.pages.length > 0) {
+        pages = this.pages;
+        reused = pages.length;
+        fullPagePreviewPending = true;
+      } else {
+        pages = await this.#fullPagePreview(text);
+        const prevByHash = new Set(this.pages.map((p) => p.dl?.hash).filter(Boolean));
+        reused = pages.filter((p) => prevByHash.has(p.dl?.hash)).length;
+        rebuilt = pages.length - reused;
+      }
+      t.lap('typeset');
+      t.lap('toc');
+      const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
+      const prevCount = this.pages.length;
+      const patches = [];
+      for (const p of pages) {
+        if (prevHashes.get(p.number) !== p.dl.hash) {
+          patches.push({ type: 'replace-page', page: p.number, displayList: p.dl });
+        }
+      }
+      if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
+      this.pages = pages;
+      this.fullPagePreviewActive = true;
+      t.lap('paginate');
+      if (fullPagePreviewPending) this.#scheduleFullPagePreview(text, earlyFullPagePreview);
+      t.lap('schedule');
+      this.rev++;
+      return {
+        rev: this.rev,
+        edit: editLabel,
+        backend: this.backendName,
+        dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
+        dirtySemanticNodes: [...dirtySource].map((id) => 'blk-' + id),
+        dirtyDependencies: [],
+        dirtyLayoutNodes: [...dirtySource].map((id) => 'galley-' + id),
+        dirtyPages: patches.filter((p) => p.type === 'replace-page').map((p) => p.page),
+        patches,
+        stats: {
+          ...t.done(),
+          blocksTotal: this.blocks.length,
+          blocksTypeset: 0,
+          blocksReparsed: dirtySource.size,
+          semanticCacheHits: this.blocks.length - dirtySource.size,
+          layoutCacheHits: this.blocks.length,
+          layoutCacheMisses: 0,
+          typesetMs: 0,
+          rebooted,
+          checkpoints: this.checkpoints.size,
+          pagesReused: reused,
+          pagesRebuilt: rebuilt,
+          pageCount: pages.length,
+          fullPagePreview: true,
+          fullPagePreviewReason: earlyFullPagePreview,
+          fullPagePreviewPending,
+          macrosChanged: [],
+          labelsChanged: [],
+          diagnostics: [`full-page exact preview path: ${earlyFullPagePreview}`],
+        },
+      };
+    }
+
     // First index whose checkpoint chain is invalid. A checkpoint at idx
     // holds the state after blocks[0..idx-1], so it survives exactly when
     // that prefix is unchanged — pure deletions/insertions invalidate from
@@ -1251,9 +1318,51 @@ export class CheckpointEngine {
       if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
       this.pages = pages;
       this.fullPagePreviewActive = true;
-      if (patches.length && this.onAsyncPatches) {
+      if (this.onAsyncPatches) {
         this.rev++;
-        this.onAsyncPatches({ rev: this.rev, patches });
+        const dirtyPages = patches.filter((p) => p.type === 'replace-page').map((p) => p.page);
+        this.onAsyncPatches({
+          rev: this.rev,
+          patches,
+          report: {
+            rev: this.rev,
+            edit: `async full-page preview: ${reason}`,
+            backend: this.backendName,
+            dirtySourceNodes: [],
+            dirtySemanticNodes: [],
+            dirtyDependencies: [],
+            dirtyLayoutNodes: [],
+            dirtyPages,
+            patches,
+            stats: {
+              bootUs: 0,
+              segmentUs: 0,
+              typesetUs: 0,
+              tocUs: 0,
+              paginateUs: 0,
+              scheduleUs: 0,
+              totalUs: 0,
+              blocksTotal: this.blocks.length,
+              blocksTypeset: 0,
+              blocksReparsed: 0,
+              semanticCacheHits: this.blocks.length,
+              layoutCacheHits: this.blocks.length,
+              layoutCacheMisses: 0,
+              typesetMs: 0,
+              rebooted: false,
+              checkpoints: this.checkpoints.size,
+              pagesReused: Math.max(0, pages.length - dirtyPages.length),
+              pagesRebuilt: dirtyPages.length,
+              pageCount: pages.length,
+              fullPagePreview: true,
+              fullPagePreviewReason: reason,
+              fullPagePreviewPending: false,
+              macrosChanged: [],
+              labelsChanged: [],
+              diagnostics: [`full-page exact preview completed async: ${reason}`],
+            },
+          },
+        });
       }
     })().catch((err) => {
       if (stillCurrent()) this.diagnostics.push(`full-page exact preview failed async (${err.message})`);
@@ -1850,6 +1959,9 @@ function scanCounterDefs(preamble) {
 }
 
 function fullPagePreviewReason(text) {
+  for (const multicol of text.matchAll(/\\begin\s*\{multicols\}\s*\{(\d+)\}/g)) {
+    if ((Number(multicol[1]) || 0) >= 4) return 'multicols environment with 4+ columns';
+  }
   if (/\\begin\s*\{paracol\*?\}/.test(text)) return 'paracol environment';
   if (/\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(text)) return 'twocolumn class option';
   if (/\\twocolumn\b/.test(text)) return '\\twocolumn command';
@@ -1857,9 +1969,9 @@ function fullPagePreviewReason(text) {
 }
 
 function multicolBlockInfo(text) {
-  const m = text.match(/\\begin\s*\{multicols\*?\}\s*\{(\d+)\}/);
+  const m = text.match(/\\begin\s*\{(multicols\*?)\}\s*\{(\d+)\}/);
   if (!m) return null;
-  return { cols: Math.max(2, Math.min(20, Number(m[1]) || 2)) };
+  return { cols: Math.max(2, Math.min(20, Number(m[2]) || 2)), starred: m[1].endsWith('*') };
 }
 
 function dimBp(v) {
