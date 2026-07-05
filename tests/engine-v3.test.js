@@ -64,6 +64,12 @@ test('display lists carry real glyph runs with TeX positions', opts, () => {
   assert.ok(rules.length >= 1, 'fraction bars / rules present');
 });
 
+test('ordinary one-column preview keeps the original editable display path', opts, () => {
+  const commands = eng.getDisplayLists().flatMap((p) => p.commands);
+  assert.equal(commands.filter((c) => c.layout === 'multicol').length, 0);
+  assert.equal(commands.filter((c) => c.op === 'hitbox').length, 0);
+});
+
 test('equation insertion renumbers downstream through the live chain', opts, async () => {
   const src = eng.getSource();
   const idx = src.indexOf('\\begin{equation}');
@@ -161,4 +167,81 @@ test('label renames propagate backwards to earlier referencing blocks', opts, as
   await eng.edit(l2, l2 + 18, '\\label{fig:plot}');
   const rb2 = eng.blocks.find((b) => b.text.includes('is a genuine float'));
   assert.ok(!JSON.stringify(rb2.galley.items).includes('??'), 'restored and resolved');
+});
+
+test('multicols starting mid-page stays on the resident glyph preview path', opts, async () => {
+  const body = Array.from(
+    { length: 18 },
+    (_, i) =>
+      `Paragraph ${i + 1}. ` +
+      'The multicol package balances text into multiple columns inside the page. '.repeat(5)
+  ).join('\n\n');
+  const tex = String.raw`\documentclass{article}
+\usepackage[a4paper,margin=20mm]{geometry}
+\usepackage{multicol}
+\title{Multicol Probe}
+\author{Fermion}
+\date{}
+\begin{document}
+\maketitle
+\section{Before}
+This paragraph is before the multicols environment and should span the normal text width.
+
+\begin{multicols}{2}
+\section{Inside Multicols}
+` + body + String.raw`
+\end{multicols}
+
+\section{After}
+This paragraph is after the environment and should return to normal width.
+\end{document}
+`;
+  const report = await eng.open(tex);
+  assert.equal(report.stats.fullPagePreview, false);
+  assert.equal(report.stats.fullPagePreviewReason, '');
+  assert.equal(report.stats.pageCount, 2);
+  const pages = eng.getDisplayLists();
+  assert.equal(pages.length, 2);
+  assert.ok(pages.every((p) => p.commands.some((c) => c.op === 'glyphs')));
+  assert.equal(pages.flatMap((p) => p.commands).filter((c) => c.op === 'chunk').length, 0);
+  assert.ok(
+    pages.some((p) => p.commands.some((c) => c.op === 'glyphs' && /^b\d+$/.test(c.src))),
+    'multicol preview exposes editable glyph source regions'
+  );
+  assert.ok(
+    pages.some((p) => p.commands.some((c) => c.op === 'glyphs' && c.x > 300)),
+    'right-column glyphs are present in the resident display list'
+  );
+  const hitboxes = pages.flatMap((p) => p.commands.filter((c) => c.op === 'hitbox' && c.layout === 'multicol'));
+  assert.ok(hitboxes.length >= 2, 'multicol preview exposes column hitboxes');
+  assert.ok(hitboxes.some((c) => c.column === 0), 'left column hitbox present');
+  assert.ok(hitboxes.some((c) => c.column === 1), 'right column hitbox present');
+  for (const page of pages.filter((p) => p.commands.some((c) => c.op === 'glyphs' && c.layout === 'multicol'))) {
+    const columns = new Set(
+      page.commands
+        .filter((c) => c.op === 'hitbox' && c.layout === 'multicol')
+        .map((c) => c.column)
+    );
+    assert.ok(columns.has(0), `page ${page.page} exposes a left-column edit hitbox`);
+    assert.ok(columns.has(1), `page ${page.page} exposes a right-column edit hitbox`);
+  }
+  const geo = eng.getGeometry();
+  assert.ok(
+    hitboxes.every((c) => c.y >= -0.5 && c.y + c.h <= geo.paperheight + 0.5),
+    'multicol edit hitboxes stay within the visible page'
+  );
+  assert.ok(
+    eng.getDOM().blocks.some((b) => b.pages.length > 0),
+    'DOM block page mapping includes multicol glyphs'
+  );
+
+  const beforeEditHash = JSON.stringify(eng.getDisplayLists().map((p) => p.hash));
+  const idx = eng.getSource().indexOf('Paragraph 1.');
+  const editReport = await eng.edit(idx, idx + 'Paragraph 1'.length, 'Paragraph One');
+  assert.equal(editReport.stats.fullPagePreviewPending, false);
+  assert.ok(
+    editReport.stats.totalUs < 300_000,
+    `multicol edit should stay on the resident path (${editReport.stats.totalUs}us)`
+  );
+  assert.notEqual(JSON.stringify(eng.getDisplayLists().map((p) => p.hash)), beforeEditHash);
 });

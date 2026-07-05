@@ -370,7 +370,9 @@ function serveStatic(res, rel) {
   try {
     const file = path.join(ROOT, 'web', path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
     const body = readFileSync(file);
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    const headers = { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' };
+    if (['.js', '.css', '.html'].includes(path.extname(file))) headers['Cache-Control'] = 'no-cache';
+    res.writeHead(200, headers);
     res.end(body);
   } catch {
     res.writeHead(404);

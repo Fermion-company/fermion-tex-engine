@@ -1603,6 +1603,7 @@ function renderPage(dl, flash) {
   div.querySelector('svg')?.remove();
   div.querySelector('.sheet')?.remove();
   div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
+  div.querySelectorAll('.hitbox').forEach((e) => e.remove());
 
   // checkpoint / internal display lists carry glyph runs -> unified SVG
   // plus absolutely-positioned <img> overlays for exact-render chunks;
@@ -1621,8 +1622,10 @@ function renderPage(dl, flash) {
           `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
       );
     }
+    renderHitboxes(div, dl);
   } else {
     div.insertAdjacentHTML('beforeend', chunkSheet(dl));
+    renderHitboxes(div, dl);
   }
 
   if (flash) {
@@ -1630,6 +1633,20 @@ function renderPage(dl, flash) {
     div.classList.add('patched');
     requestAnimationFrame(() => div.classList.add('fading'));
     setTimeout(() => div.classList.remove('patched', 'fading'), 1200);
+  }
+}
+
+function renderHitboxes(pageDiv, dl) {
+  const W = geometry.paperwidth;
+  const H = geometry.paperheight;
+  for (const cmd of dl.commands) {
+    if (cmd.op !== 'hitbox') continue;
+    const layoutAttr = cmd.layout ? ` data-layout="${escapeHtml(cmd.layout)}"` : '';
+    const columnAttr = Number.isFinite(cmd.column) ? ` data-column="${cmd.column}"` : '';
+    pageDiv.insertAdjacentHTML(
+      'beforeend',
+      `<div class="hitbox" data-src="${escapeHtml(cmd.src)}"${layoutAttr}${columnAttr} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%"></div>`
+    );
   }
 }
 
@@ -1678,12 +1695,14 @@ function svgFor(dl) {
         const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
+      const layoutAttr = cmd.layout ? ` data-layout="${escapeHtml(cmd.layout)}"` : '';
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}" xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${layoutAttr} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
     } else if (cmd.op === 'rule') {
+      const layoutAttr = cmd.layout ? ` data-layout="${escapeHtml(cmd.layout)}"` : '';
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${layoutAttr}/>`
       );
     } else if (cmd.op === 'chunk') {
       // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
@@ -1772,8 +1791,10 @@ function flushSync() {
           : backend === 'lualatex'
             ? `lualatex ${report.stats.lualatexMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
             : `engine ${fmtUs(report.stats.totalUs)}`;
+      const exactPending = report.stats.fullPagePreviewPending ? ' / exact更新中' : '';
       statusEl.textContent =
         `update #${report.rev} [${backend}] — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
+        exactPending +
         (report.dirtyPages.length
           ? ` / patched pages: ${report.dirtyPages.join(', ')}`
           : ' / 表示差分なし');
@@ -1801,7 +1822,8 @@ editor.addEventListener('scroll', syncEditorHighlight);
 //   click     -> PowerPoint-style box editing right on the page
 //   Alt+click -> jump to the source in the left editor (legacy behavior)
 pagesEl.addEventListener('click', async (ev) => {
-  const src = srcOf(ev.target);
+  const hit = sourceHitFromEvent(ev);
+  const src = hit?.src;
   if (!src) return;
   if (ev.altKey) {
     const dom = await fetch('/dom').then((r) => r.json());
@@ -1815,7 +1837,7 @@ pagesEl.addEventListener('click', async (ev) => {
     statusEl.textContent = `ソース対応: ${src} → main.tex:${block.source.start.line} (${block.type})`;
     return;
   }
-  openBox(src, ev.target);
+  openBox(src, hit.el ?? ev.target, { x: ev.clientX, y: ev.clientY });
 });
 
 function lineColToOffset(text, line, col) {
@@ -4920,24 +4942,98 @@ function loadMathKeyboardData() {
 }
 
 function srcOf(target) {
-  const src = target?.dataset?.src ?? target?.closest?.('[data-src]')?.dataset?.src;
+  const closest = target?.closest?.('[data-src]');
+  const src =
+    target?.dataset?.src ??
+    target?.getAttribute?.('data-src') ??
+    closest?.dataset?.src ??
+    closest?.getAttribute?.('data-src');
   if (!src || src.startsWith('_')) return null;
   return src;
 }
 
-function blockRect(pageDiv, src, anchorEl = null) {
+function sourceHitFromEvent(ev) {
+  const direct = srcOf(ev.target);
+  if (direct) {
+    return {
+      src: direct,
+      el: ev.target?.closest?.('[data-src]') ?? ev.target,
+    };
+  }
+  const pageDiv = ev.target?.closest?.('.page') ?? ev.target?.ownerSVGElement?.closest?.('.page');
+  if (!pageDiv) return null;
+  const el = nearestSourceElement(pageDiv, ev.clientX, ev.clientY);
+  const src = srcOf(el);
+  return src ? { src, el } : null;
+}
+
+function nearestSourceElement(pageDiv, x, y) {
+  let best = null;
+  const els = pageDiv.querySelectorAll('svg [data-src], .hitbox[data-src], .chunkwin[data-src]');
+  for (const el of els) {
+    const src = srcOf(el);
+    if (!src) continue;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width && !rect.height) continue;
+    const pad = 3;
+    const inside =
+      x >= rect.left - pad &&
+      x <= rect.right + pad &&
+      y >= rect.top - pad &&
+      y <= rect.bottom + pad;
+    const cx = Math.max(rect.left, Math.min(x, rect.right));
+    const cy = Math.max(rect.top, Math.min(y, rect.bottom));
+    const dist = inside ? 0 : (cx - x) ** 2 + (cy - y) ** 2;
+    if (!best || dist < best.dist) best = { el, dist };
+  }
+  return best && best.dist <= 144 ? best.el : null;
+}
+
+function blockRect(pageDiv, src, anchorEl = null, point = null) {
   const els = pageDiv.querySelectorAll(`[data-src="${src}"]`);
   if (!els.length) return null;
   const p = pageDiv.getBoundingClientRect();
+  const anchorHitbox = anchorEl?.classList?.contains('hitbox') ? anchorEl : anchorEl?.closest?.('.hitbox[data-src]');
+  if (anchorHitbox?.getAttribute?.('data-src') === src) {
+    const rect = anchorHitbox.getBoundingClientRect();
+    return rectToPagePct(rect, p, 0);
+  }
   const rects = [...els]
     .map((el) => ({ el, rect: el.getBoundingClientRect() }))
     .filter(({ rect }) => rect.width !== 0 || rect.height !== 0);
   if (!rects.length) return null;
   let selectedRects = rects.map(({ rect }) => rect);
+  const isMulticol = [...els].some((el) => el.getAttribute?.('data-layout') === 'multicol');
   const anchor = anchorEl?.closest?.(`[data-src="${src}"]`) ?? (anchorEl?.dataset?.src === src ? anchorEl : null);
-  if (anchor) {
-    const anchorRect = anchor.getBoundingClientRect();
-    const sorted = rects.map(({ rect }) => rect).sort((a, b) => a.top - b.top || a.left - b.left);
+  let anchorRect = anchor?.getBoundingClientRect?.() ?? null;
+  if (!anchorRect && point) {
+    let best = null;
+    for (const { rect } of rects) {
+      const cx = Math.max(rect.left, Math.min(point.x, rect.right));
+      const cy = Math.max(rect.top, Math.min(point.y, rect.bottom));
+      const dist = (cx - point.x) ** 2 + (cy - point.y) ** 2;
+      if (!best || dist < best.dist) best = { rect, dist };
+    }
+    anchorRect = best?.rect ?? null;
+  }
+  if (anchorRect) {
+    let candidates = rects.map(({ rect }) => rect);
+    const lineStarts = columnLineStarts(candidates, p.width);
+    const splitInfo = columnSplitFromStarts(lineStarts, p.width);
+    if (splitInfo || (isMulticol && point)) {
+      const anchorCenter = (anchorRect.left + anchorRect.right) / 2;
+      const split = splitInfo?.split ?? (p.left + p.width / 2);
+      const left = anchorCenter < split ? -Infinity : split;
+      const right = anchorCenter < split ? split : Infinity;
+      const anchorIsWide = anchorRect.width >= p.width * 0.65;
+      const sameColumn = candidates.filter((rect) => {
+        if (!anchorIsWide && rect.width >= p.width * 0.65) return false;
+        const center = (rect.left + rect.right) / 2;
+        return center >= left && center <= right;
+      });
+      if (sameColumn.length) candidates = sameColumn;
+    }
+    const sorted = candidates.sort((a, b) => a.top - b.top || a.left - b.left);
     const anchorIndex = sorted.findIndex((rect) => rect.left === anchorRect.left && rect.top === anchorRect.top && rect.right === anchorRect.right && rect.bottom === anchorRect.bottom);
     if (anchorIndex >= 0) {
       let first = anchorIndex;
@@ -4955,12 +5051,54 @@ function blockRect(pageDiv, src, anchorEl = null) {
   }
   if (!isFinite(l)) return null;
   const pad = 5;
+  return rectToPagePct({ left: l, top: t, right: r, bottom: b }, p, pad);
+}
+
+function rectToPagePct(rect, pageRect, pad = 0) {
   return {
-    left: ((l - p.left - pad) / p.width) * 100,
-    top: ((t - p.top - pad) / p.height) * 100,
-    width: ((r - l + 2 * pad) / p.width) * 100,
-    height: ((b - t + 2 * pad) / p.height) * 100,
+    left: ((rect.left - pageRect.left - pad) / pageRect.width) * 100,
+    top: ((rect.top - pageRect.top - pad) / pageRect.height) * 100,
+    width: ((rect.right - rect.left + 2 * pad) / pageRect.width) * 100,
+    height: ((rect.bottom - rect.top + 2 * pad) / pageRect.height) * 100,
   };
+}
+
+function columnLineStarts(rects, pageWidth) {
+  const sorted = rects
+    .filter((rect) => rect.width > 0 && rect.width < pageWidth * 0.65)
+    .sort((a, b) => a.top - b.top || a.left - b.left);
+  const lines = [];
+  for (const rect of sorted) {
+    let line = lines[lines.length - 1];
+    if (!line || Math.abs(rect.top - line.top) > 3.5) {
+      line = { top: rect.top, left: rect.left, right: rect.right, count: 0 };
+      lines.push(line);
+    }
+    line.left = Math.min(line.left, rect.left);
+    line.right = Math.max(line.right, rect.right);
+    line.count++;
+  }
+  return lines
+    .filter((line) => line.count >= 2 && line.right - line.left < pageWidth * 0.65)
+    .map((line) => line.left)
+    .sort((a, b) => a - b);
+}
+
+function columnSplitFromStarts(starts, pageWidth) {
+  if (starts.length < 10) return null;
+  let widestGap = 0;
+  let gapAt = -1;
+  for (let i = 1; i < starts.length; i++) {
+    const gap = starts[i] - starts[i - 1];
+    if (gap > widestGap) {
+      widestGap = gap;
+      gapAt = i;
+    }
+  }
+  const leftCount = gapAt > 0 ? gapAt : 0;
+  const rightCount = gapAt > 0 ? starts.length - gapAt : 0;
+  if (widestGap < pageWidth * 0.2 || leftCount < 4 || rightCount < 4) return null;
+  return { split: (starts[gapAt - 1] + starts[gapAt]) / 2 };
 }
 
 function highlightSelectedPreviewBlock(src = selectedWordBlockId, { scroll = false } = {}) {
@@ -4991,10 +5129,11 @@ function highlightSelectedPreviewBlock(src = selectedWordBlockId, { scroll = fal
 
 pagesEl.addEventListener('mousemove', (ev) => {
   if (boxState) return;
-  const src = srcOf(ev.target);
-  const pageDiv = ev.target?.closest?.('.page');
+  const hit = sourceHitFromEvent(ev);
+  const src = hit?.src;
+  const pageDiv = hit?.el?.closest?.('.page') ?? ev.target?.closest?.('.page');
   if (!src || !pageDiv) { hidePreviewInsertionAffordance(); return; }
-  const rect = blockRect(pageDiv, src, ev.target);
+  const rect = blockRect(pageDiv, src, hit.el ?? ev.target, { x: ev.clientX, y: ev.clientY });
   if (!rect) { hidePreviewInsertionAffordance(); return; }
   if (hoverBox.parentElement !== pageDiv) pageDiv.appendChild(hoverBox);
   Object.assign(hoverBox.style, {
@@ -5110,7 +5249,7 @@ function buildPreviewInsertTex(type, title, body) {
   return `\n${escapeLatexText(text)}\n`;
 }
 
-async function openBox(src, anchorEl = null) {
+async function openBox(src, anchorEl = null, point = null) {
   closeBox();
   const dom = await fetch('/dom').then((r) => r.json());
   const block = dom.blocks.find((b) => b.id === src);
@@ -5123,7 +5262,7 @@ async function openBox(src, anchorEl = null) {
     d.querySelector(`[data-src="${src}"]`)
   );
   if (!pageDiv) return;
-  const rect = blockRect(pageDiv, src, anchorEl);
+  const rect = blockRect(pageDiv, src, anchorEl, point);
   if (!rect) return;
   hoverBox.style.display = 'none';
 
@@ -6339,6 +6478,7 @@ function placeBoxEdit(wrap, rect) {
   const maxWidth = isMath ? 98 : 88;
   const width = Math.min(Math.max(rect.width, minWidth), maxWidth);
   const left = Math.max(1, Math.min(rect.left, 99 - width));
+  wrap.classList.toggle('is-column-edit', rect.width < 55);
   Object.assign(wrap.style, {
     left: left + '%',
     top: rect.top + '%',
@@ -6557,6 +6697,7 @@ sse.onmessage = (ev) => {
         }
         repositionBox();
         highlightSelectedPreviewBlock();
+        statusEl.textContent = `async preview #${msg.rev} [${backend}] — exact更新完了`;
       }
       return;
     }

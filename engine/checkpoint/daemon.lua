@@ -39,6 +39,7 @@ local pending_fmarks = {}
 local geo_extra = {}
 local RENDER_MODE = false
 local FLOAT_COPIES = {}
+local captured_output_pages = {}
 
 local SP2BP = 65781.76
 -- 6 decimals: page assembly sums hundreds of these; 3 decimals accumulated
@@ -109,6 +110,7 @@ function tdom_geo()
     paperheight = dim('paperheight'),
     textwidth = dim('textwidth'),
     textheight = dim('textheight'),
+    columnsep = dim('columnsep'),
     oddsidemargin = dim('oddsidemargin'),
     topmargin = dim('topmargin'),
     headheight = dim('headheight'),
@@ -657,6 +659,41 @@ function tdom_absorb_output()
   pcall(function() tex.pagetotal = 0 end)
 end
 
+-- Some packages, notably multicol, install their own output routine and call
+-- LaTeX's \@outputpage directly. In the resident engine that page must not be
+-- shipped to PDF; keep the already assembled vbox and report it as ordinary
+-- galley material followed by a forced page break.
+function tdom_capture_outputpage(boxnum, targetsp)
+  local b = tex.box[boxnum]
+  if not b then return end
+  local items = extract_items(b, nil)
+  local target = bp(tonumber(targetsp) or 0)
+  if target > 0 and #items == 1 and items[1].k == 'box' and (items[1].h or 0) > target then
+    items[1].h = target
+    items[1].d = 0
+  end
+  -- VLIST extraction reports child baselines from the box top. The browser page
+  -- builder anchors every box at its TeX baseline, so convert top-relative
+  -- output-page runs into baseline-relative runs. Later multicol pages can
+  -- already arrive baseline-relative after splitting; leave those untouched.
+  if #items == 1 and items[1].k == 'box' then
+    local min_dy = nil
+    for _, r in ipairs(items[1].runs or {}) do
+      local dy = tonumber(r.dy)
+      if dy then
+        min_dy = min_dy and math.min(min_dy, dy) or dy
+      end
+    end
+    if min_dy and min_dy >= -0.5 then
+      local h = items[1].h or 0
+      for _, r in ipairs(items[1].runs or {}) do
+        r.dy = (r.dy or 0) - h
+      end
+    end
+  end
+  captured_output_pages[#captured_output_pages + 1] = items
+end
+
 -- Called from the float environment shims: capture the float box galley.
 function tdom_float(n, placement, ftype)
   local box = tex.box[TDOM_FLOATBOX]
@@ -717,7 +754,14 @@ function tdom_report()
   local head = harvest_nodes()
   colstack = {}
   pending_fmarks = {}
-  local items = extract_items(head, nil)
+  local items = {}
+  for _, pg in ipairs(captured_output_pages) do
+    for _, it in ipairs(pg) do items[#items + 1] = it end
+    items[#items + 1] = { k = 'eject', v = -10000 }
+  end
+  captured_output_pages = {}
+  local harvested = extract_items(head, nil)
+  for _, it in ipairs(harvested) do items[#items + 1] = it end
   local w, hsum = 0, 0
   for _, it in ipairs(items) do
     if it.k == 'box' then
@@ -857,6 +901,7 @@ function tdom_wait()
         blk_gfx = false
         blk_floats = {}
         pending_fmarks = {}
+        captured_output_pages = {}
         RENDER_MODE = false
         reconnect('job', newckpt)
         inject_job(body, false)
@@ -874,6 +919,7 @@ function tdom_wait()
         JOB = { id = id, ckpt = -1, body = body }
         blk_floats = {}
         pending_fmarks = {}
+        captured_output_pages = {}
         RENDER_MODE = true
         FLOAT_COPIES = {}
         reconnect('render', 0)

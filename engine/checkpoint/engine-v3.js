@@ -78,6 +78,8 @@ export class CheckpointEngine {
     this.includes = new Map(); // path -> {mtime, text}
     this.watchers = new Map(); // path -> FSWatcher
     this.maxCheckpoints = 64;
+    this.fullPagePreviewActive = false;
+    this.fullPagePreviewSeq = 0;
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -148,6 +150,12 @@ export class CheckpointEngine {
         if (!bid) continue;
         if (!blockPages.has(bid)) blockPages.set(bid, []);
         const arr = blockPages.get(bid);
+        if (arr[arr.length - 1] !== page.number) arr.push(page.number);
+      }
+      for (const cmd of page.dl?.commands ?? []) {
+        if (cmd.op !== 'hitbox' || !cmd.src) continue;
+        if (!blockPages.has(cmd.src)) blockPages.set(cmd.src, []);
+        const arr = blockPages.get(cmd.src);
         if (arr[arr.length - 1] !== page.number) arr.push(page.number);
       }
     }
@@ -411,6 +419,17 @@ export class CheckpointEngine {
     L.push("\\def\\@bibitem#1{\\TDOMbibitem{#1}\\directlua{tdom_bib('\\luaescapestring{#1}','\\luaescapestring{\\the\\value{enumiv}}')}}\\fi");
     L.push('\\ifdefined\\@lbibitem\\let\\TDOMlbibitem\\@lbibitem');
     L.push("\\def\\@lbibitem[#1]#2{\\TDOMlbibitem[#1]{#2}\\directlua{tdom_bib('\\luaescapestring{#2}','\\luaescapestring{#1}')}}\\fi");
+    // Packages such as multicol can bypass our dormant \output handler by
+    // calling LaTeX's \@outputpage from their own output routine. Capture
+    // the assembled page box back into the resident galley instead of
+    // shipping it to the driver's PDF.
+    L.push('\\newbox\\TDOMoutputpagebox');
+    L.push('\\let\\TDOMorigoutputpage\\@outputpage');
+    L.push(
+      '\\def\\@outputpage{\\global\\setbox\\TDOMoutputpagebox\\box\\@outputbox' +
+        '\\directlua{tdom_capture_outputpage(\\number\\TDOMoutputpagebox,\\number\\@colroom)}' +
+        '\\global\\advance\\c@page\\@ne}'
+    );
     // page-builder geometry: every parameter the output routine uses is read
     // from the live TeX run — glue parameters travel with their full
     // stretch/shrink specification (\gluestretch etc. are LuaTeX primitives)
@@ -514,13 +533,17 @@ export class CheckpointEngine {
     const prelude = defs.length
       ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
       : '';
+    const multicolRoom = multicolBlockInfo(block.text) ? this.#remainingTextHeightBefore(idx) : null;
+    const layoutPrelude = multicolRoom != null
+      ? `\\makeatletter\\global\\@colroom=${dimBp(multicolRoom)}\\relax\\makeatother\n`
+      : '';
     // Mid-typing safety: an unclosed brace makes a \long macro argument
     // scan past the injected \par/report tokens to EOF and kills the child
     // (the old \vbox wrapper stopped it structurally). Auto-close the
     // imbalance — the source is transiently invalid anyway, and the exact
     // path resumes on the next balanced keystroke.
     const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    const body = Buffer.from(prelude + block.text + guard, 'utf8');
+    const body = Buffer.from(prelude + layoutPrelude + block.text + guard, 'utf8');
     const galleyKey = 'galley:' + block.id;
     const ckptKey = 'ckpt:' + (idx + 1);
     const galleyP = this.#await(galleyKey);
@@ -535,6 +558,37 @@ export class CheckpointEngine {
     } finally {
       this.currentJob = null;
     }
+  }
+
+  #remainingTextHeightBefore(idx) {
+    if (!this.geometry?.textheight || idx <= 0) return null;
+    const stream = [];
+    for (let j = 0; j < idx; j++) {
+      const block = this.blocks[j];
+      if (!block?.galley) continue;
+      const bc = this.chunks.get(block.id);
+      const hasChunk = !!bc && bc.forGalley === block.galleyHash;
+      stream.push(...buildStream(block, hasChunk, this.chunks));
+    }
+    const probe = {
+      blockId: '_tdom_probe',
+      li: -1,
+      h: 0.01,
+      d: 0,
+      ln: { descent: 0, boxH: 0.01, runs: [], gfxChunk: null },
+    };
+    stream.push({ t: 'box', u: probe });
+    const pages = buildPages(stream, this.geometry);
+    const page = pages.find((p) => (p.draw ?? []).some((d) => d.u === probe));
+    const entry = page?.draw?.find((d) => d.u === probe);
+    if (!page || !entry) return null;
+    const priorDraw = (page.draw ?? []).some((d) => d.u !== probe);
+    const priorFloats = (page.topFloats?.length ?? 0) + (page.botFloats?.length ?? 0);
+    if (!priorDraw && !priorFloats) return this.geometry.textheight;
+    const top = Math.max(0, entry.y - probe.h);
+    const remaining = this.geometry.textheight - top;
+    if (!Number.isFinite(remaining)) return null;
+    return Math.max(0, Math.min(this.geometry.textheight, remaining));
   }
 
   // Sparse checkpoints: for large documents only every grid-th boundary
@@ -836,8 +890,41 @@ export class CheckpointEngine {
     const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop } = this._typesetResult;
 
     // ---- pages, display lists, patches ---------------------------------
-    const pagesRaw = this.#paginateNow();
-    const { pages, reused, rebuilt } = reconcile(pagesRaw, this.pages);
+    const fullPagePreview = fullPagePreviewReason(text);
+    const deferFullPagePreview = !!fullPagePreview && editLabel !== 'open' && this.pages.length > 0;
+    let fullPagePreviewPending = false;
+    let pagesRaw;
+    let pages;
+    let reused;
+    let rebuilt;
+    if (!fullPagePreview) this.fullPagePreviewSeq++;
+    if (fullPagePreview && !deferFullPagePreview) {
+      try {
+        pages = await this.#fullPagePreview(text);
+        const prevByHash = new Set(this.pages.map((p) => p.dl?.hash).filter(Boolean));
+        reused = pages.filter((p) => prevByHash.has(p.dl?.hash)).length;
+        rebuilt = pages.length - reused;
+        diagnostics.push(`full-page exact preview path: ${fullPagePreview}`);
+      } catch (err) {
+        diagnostics.push(`full-page exact preview failed (${err.message}); using live page builder`);
+      }
+    }
+    if (!pages) {
+      if (fullPagePreview && deferFullPagePreview && this.fullPagePreviewActive) {
+        pages = this.pages;
+        reused = pages.length;
+        rebuilt = 0;
+        fullPagePreviewPending = true;
+        diagnostics.push(`full-page exact preview queued: ${fullPagePreview}`);
+      } else {
+        pagesRaw = this.#paginateNow();
+        ({ pages, reused, rebuilt } = reconcile(pagesRaw, this.pages));
+        if (fullPagePreview && deferFullPagePreview) {
+          fullPagePreviewPending = true;
+          diagnostics.push(`full-page exact preview queued: ${fullPagePreview}`);
+        }
+      }
+    }
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
     const prevCount = this.pages.length;
     const patches = [];
@@ -851,10 +938,12 @@ export class CheckpointEngine {
     }
     if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
     this.pages = pages;
+    this.fullPagePreviewActive = !!fullPagePreview && !pagesRaw;
     t.lap('paginate');
 
     // ---- async work: rebuild remaining checkpoint chain + gfx renders --
     this.#scheduleBackground(fgStop, dirtyBlocks);
+    if (fullPagePreviewPending) this.#scheduleFullPagePreview(text, fullPagePreview);
     t.lap('schedule');
 
     this.rev++;
@@ -882,6 +971,9 @@ export class CheckpointEngine {
         pagesReused: reused,
         pagesRebuilt: rebuilt,
         pageCount: pages.length,
+        fullPagePreview: !!fullPagePreview && !pagesRaw,
+        fullPagePreviewReason: fullPagePreview,
+        fullPagePreviewPending,
         macrosChanged: [],
         labelsChanged: [...changedLabels],
         diagnostics: [...diagnostics, ...this.diagnostics.splice(0)],
@@ -1113,6 +1205,7 @@ export class CheckpointEngine {
   #asyncRepaginate() {
     // rebuild display lists after async galley/chunk arrivals and push
     // patches through the async channel (SSE)
+    if (this.fullPagePreviewActive) return;
     const rawPages = this.#paginateNow();
     const { pages } = reconcile(rawPages, this.pages);
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
@@ -1131,6 +1224,155 @@ export class CheckpointEngine {
       this.rev++;
       this.onAsyncPatches({ rev: this.rev, patches });
     }
+  }
+
+  #scheduleFullPagePreview(text, reason) {
+    const token = ++this.fullPagePreviewSeq;
+    const sourceHash = fnv1a(text);
+    const stillCurrent = () =>
+      token === this.fullPagePreviewSeq &&
+      fnv1a(this.store.get(this.file)) === sourceHash &&
+      fullPagePreviewReason(this.store.get(this.file)) === reason;
+
+    (async () => {
+      await sleep(250);
+      if (!stillCurrent()) return;
+      const pages = await this.#fullPagePreview(text, `async-${token}`, stillCurrent);
+      if (!pages || !stillCurrent()) return;
+
+      const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
+      const prevCount = this.pages.length;
+      const patches = [];
+      for (const page of pages) {
+        if (page.dl?.hash !== prevHashes.get(page.number)) {
+          patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
+        }
+      }
+      if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
+      this.pages = pages;
+      this.fullPagePreviewActive = true;
+      if (patches.length && this.onAsyncPatches) {
+        this.rev++;
+        this.onAsyncPatches({ rev: this.rev, patches });
+      }
+    })().catch((err) => {
+      if (stillCurrent()) this.diagnostics.push(`full-page exact preview failed async (${err.message})`);
+    });
+  }
+
+  async #fullPagePreview(text, jobTag = 'sync', shouldApply = () => true) {
+    const safeTag = String(jobTag).replace(/[^0-9A-Za-z_-]+/g, '_');
+    const jobdir = path.join(this.workDir, `full-page-preview-${safeTag}`);
+    rmSync(jobdir, { recursive: true, force: true });
+    mkdirSync(jobdir, { recursive: true });
+    const tex = path.join(jobdir, 'preview.tex');
+    writeFileSync(tex, text.replace(/\r\n?/g, '\n'), 'utf8');
+    const repoRoot = path.resolve(DIR, '..', '..');
+    const env = {
+      ...process.env,
+      TEXINPUTS: `${this.docDir}//:${this.workDir}//:${jobdir}//:${repoRoot}//:${process.env.TEXINPUTS || ''}`,
+      LUAINPUTS: `${this.docDir}//:${this.workDir}//:${jobdir}//:${repoRoot}//:${process.env.LUAINPUTS || ''}`,
+    };
+    const run = () =>
+      execFileP(
+        'lualatex',
+        ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', jobdir, tex],
+        { cwd: this.docDir, timeout: 120_000, env }
+      );
+    await run();
+    await run();
+    const pdf = path.join(jobdir, 'preview.pdf');
+    if (!existsSync(pdf)) throw new Error('full-page compile produced no PDF');
+    const info = await execFileP('pdfinfo', [pdf], { timeout: 30_000 });
+    const pageCount = Number(info.stdout.match(/^Pages:\s+(\d+)/m)?.[1] ?? 0);
+    if (!pageCount) throw new Error('could not read full-page PDF page count');
+    const geo = this.geometry ?? {};
+    const w = geo.paperwidth ?? 612;
+    const h = geo.paperheight ?? 792;
+    const hitboxes = await this.#fullPageHitboxes(pdf, w, h).catch((err) => {
+      this.diagnostics.push(`full-page hitboxes unavailable: ${err.message}`);
+      return new Map();
+    });
+    const pageSvgs = [];
+    for (let n = 1; n <= pageCount; n++) {
+      const key = `_fullpage-${n}`;
+      const svgPath = path.join(jobdir, `page-${n}.svg`);
+      await execFileP('pdftocairo', ['-svg', '-f', String(n), '-l', String(n), pdf, svgPath], {
+        timeout: 30_000,
+      });
+      const svg = cropSvg(readFileSync(svgPath, 'utf8'), w, h);
+      pageSvgs.push({ n, key, svg });
+    }
+    if (!shouldApply()) return null;
+
+    const pages = [];
+    for (const { n, key, svg } of pageSvgs) {
+      const prev = this.chunks.get(key);
+      const v = prev?.svg === svg ? prev.v : (prev?.v ?? 0) + 1;
+      this.chunks.set(key, { svg, wBp: w, hBp: h, v, forGalley: 'full-page' });
+      const commands = [
+        {
+          op: 'chunk',
+          chunk: key,
+          x: 0,
+          y: 0,
+          w: r2(w),
+          h: r2(h),
+          sy: 0,
+          ch: r2(h),
+          cv: v,
+          src: key,
+        },
+      ];
+      for (const hb of hitboxes.get(n) ?? []) {
+        commands.push({ op: 'hitbox', ...hb });
+      }
+      const dl = { page: n, commands };
+      dl.hash = fnv1a(JSON.stringify(dl.commands));
+      pages.push({
+        number: n,
+        draw: [],
+        feet: [],
+        topFloats: [],
+        botFloats: [],
+        dl,
+      });
+    }
+    return pages;
+  }
+
+  async #fullPageHitboxes(pdf, pageW, pageH) {
+    const { stdout } = await execFileP('pdftotext', ['-bbox', pdf, '-'], {
+      timeout: 30_000,
+      maxBuffer: 30 * 1024 * 1024,
+    });
+    const pageWords = parsePdfBboxWords(stdout);
+    const out = new Map();
+    for (const block of this.blocks) {
+      const terms = significantTerms(block.text);
+      if (!terms.size) continue;
+      const isWideBlock = /\\begin\s*\{(?:multicols\*?|paracol\*?)\}/.test(block.text);
+      for (const page of pageWords) {
+        const matches = page.words.filter((w) => terms.has(w.n));
+        const minMatches = isWideBlock ? 8 : Math.min(4, Math.max(2, terms.size));
+        if (matches.length < minMatches) continue;
+        const rect = rectForWords(matches, {
+          trimOutliers: isWideBlock && matches.length > 20,
+          pageW,
+          pageH,
+        });
+        if (!rect) continue;
+        if (!out.has(page.n)) out.set(page.n, []);
+        out.get(page.n).push({
+          src: block.id,
+          x: r2(rect.x),
+          y: r2(rect.y),
+          w: r2(rect.w),
+          h: r2(rect.h),
+        });
+      }
+    }
+    return out;
   }
 
   // --------------------------------------------------------------- units
@@ -1247,6 +1489,12 @@ export class CheckpointEngine {
     const L = 72 + (geo.oddsidemargin ?? 0);
     const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
     const commands = [];
+    const multicolBlocks = new Map(
+      this.blocks
+        .map((b) => [b.id, multicolBlockInfo(b.text)])
+        .filter(([, info]) => info)
+    );
+    const layoutFor = (blockId) => (multicolBlocks.has(blockId) ? 'multicol' : undefined);
     let gfxOpen = null;
     const flushGfx = () => {
       if (!gfxOpen) return;
@@ -1294,6 +1542,7 @@ export class CheckpointEngine {
             h: r2(r.h),
             color: r.c && r.c !== '#000000' ? r.c : undefined,
             src: u.blockId,
+            layout: layoutFor(u.blockId),
           });
         } else if (r.t) {
           const fmeta = this.fonts.get(r.f);
@@ -1323,11 +1572,13 @@ export class CheckpointEngine {
             text,
             color: r.c && r.c !== '#000000' ? r.c : undefined,
             src: u.blockId,
+            layout: layoutFor(u.blockId),
           });
         }
       }
     }
     flushGfx();
+    addMulticolHitboxes(commands, multicolBlocks, geo, L);
     // page style plain: \@thefoot = \hfil\thepage\hfil in an \hbox appended
     // with \baselineskip=\footskip — the folio baseline lands exactly
     // \footskip below the text area (see \@outputpage)
@@ -1598,6 +1849,157 @@ function scanCounterDefs(preamble) {
   return out;
 }
 
+function fullPagePreviewReason(text) {
+  if (/\\begin\s*\{paracol\*?\}/.test(text)) return 'paracol environment';
+  if (/\\documentclass\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(text)) return 'twocolumn class option';
+  if (/\\twocolumn\b/.test(text)) return '\\twocolumn command';
+  return '';
+}
+
+function multicolBlockInfo(text) {
+  const m = text.match(/\\begin\s*\{multicols\*?\}\s*\{(\d+)\}/);
+  if (!m) return null;
+  return { cols: Math.max(2, Math.min(20, Number(m[1]) || 2)) };
+}
+
+function dimBp(v) {
+  return `${Math.max(0, Number(v) || 0).toFixed(6)}bp`;
+}
+
+function addMulticolHitboxes(commands, multicolBlocks, geo, leftEdge) {
+  if (!multicolBlocks.size) return;
+  const textwidth = geo.textwidth ?? 0;
+  const columnsep = geo.columnsep ?? 10;
+  if (!(textwidth > 0)) return;
+  const boxes = new Map();
+  for (const cmd of commands) {
+    const info = cmd.src ? multicolBlocks.get(cmd.src) : null;
+    if (!info || cmd.layout !== 'multicol') continue;
+    const cols = info.cols;
+    const colW = (textwidth - (cols - 1) * columnsep) / cols;
+    if (!(colW > 0)) continue;
+    const stride = colW + columnsep;
+    const relX = (cmd.x ?? leftEdge) - leftEdge;
+    const col = Math.max(0, Math.min(cols - 1, Math.floor((relX + columnsep / 2) / stride)));
+    const key = `${cmd.src}:${col}`;
+    let y0;
+    let y1;
+    if (cmd.op === 'glyphs') {
+      const size = cmd.size ?? 10;
+      y0 = (cmd.y ?? 0) - size;
+      y1 = (cmd.y ?? 0) + size * 0.35;
+    } else if (cmd.op === 'rule') {
+      y0 = cmd.y ?? 0;
+      y1 = (cmd.y ?? 0) + (cmd.h ?? 0);
+    } else {
+      continue;
+    }
+    const x0 = leftEdge + col * stride;
+    const x1 = x0 + colW;
+    const prev = boxes.get(key);
+    if (prev) {
+      prev.y0 = Math.min(prev.y0, y0);
+      prev.y1 = Math.max(prev.y1, y1);
+    } else {
+      boxes.set(key, { src: cmd.src, col, x0, x1, y0, y1 });
+    }
+  }
+  for (const box of boxes.values()) {
+    if (!(box.y1 > box.y0)) continue;
+    const padY = 4;
+    commands.push({
+      op: 'hitbox',
+      src: box.src,
+      layout: 'multicol',
+      column: box.col,
+      x: r2(box.x0),
+      y: r2(Math.max(0, box.y0 - padY)),
+      w: r2(box.x1 - box.x0),
+      h: r2(box.y1 - box.y0 + 2 * padY),
+    });
+  }
+}
+
+function parsePdfBboxWords(xml) {
+  const pages = [];
+  const pageRe = /<page\b([^>]*)>([\s\S]*?)<\/page>/g;
+  let pm;
+  while ((pm = pageRe.exec(xml))) {
+    const attrs = pm[1];
+    const n = Number(attrs.match(/\bnumber="(\d+)"/)?.[1] ?? pages.length + 1);
+    const words = [];
+    const wordRe = /<word xMin="([0-9.]+)" yMin="([0-9.]+)" xMax="([0-9.]+)" yMax="([0-9.]+)">([\s\S]*?)<\/word>/g;
+    let wm;
+    while ((wm = wordRe.exec(pm[2]))) {
+      const text = decodeXmlText(wm[5]);
+      const norm = normWord(text);
+      if (!norm) continue;
+      words.push({
+        x0: Number(wm[1]),
+        y0: Number(wm[2]),
+        x1: Number(wm[3]),
+        y1: Number(wm[4]),
+        t: text,
+        n: norm,
+      });
+    }
+    pages.push({ n, words });
+  }
+  return pages;
+}
+
+function significantTerms(tex) {
+  const plain = tex
+    .replace(/%[^\n]*/g, ' ')
+    .replace(/\\(?:begin|end)\s*\{[^}]+\}/g, ' ')
+    .replace(/\\[a-zA-Z@]+\*?(?:\s*\[[^\]]*\])?/g, ' ')
+    .replace(/[{}_$^~&#]/g, ' ');
+  const out = new Set();
+  for (const raw of plain.split(/[^0-9A-Za-z]+/)) {
+    const w = normWord(raw);
+    if (!w || STOP_WORDS.has(w)) continue;
+    if (w.length < 4 && !/^\d+$/.test(w)) continue;
+    out.add(w);
+  }
+  return out;
+}
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'into', 'from', 'this', 'that',
+  'here', 'there', 'page', 'text', 'will', 'should',
+]);
+
+function rectForWords(words, { trimOutliers = false, pageW = 612, pageH = 792 } = {}) {
+  let use = words;
+  if (trimOutliers && words.length >= 10) {
+    const ys = words.map((w) => w.y0).sort((a, b) => a - b);
+    const y0 = ys[Math.floor(ys.length * 0.05)];
+    const y1 = ys[Math.ceil(ys.length * 0.95) - 1];
+    use = words.filter((w) => w.y0 >= y0 && w.y0 <= y1);
+  }
+  if (!use.length) return null;
+  const pad = 4;
+  const x0 = Math.max(0, Math.min(...use.map((w) => w.x0)) - pad);
+  const y0 = Math.max(0, Math.min(...use.map((w) => w.y0)) - pad);
+  const x1 = Math.min(pageW, Math.max(...use.map((w) => w.x1)) + pad);
+  const y1 = Math.min(pageH, Math.max(...use.map((w) => w.y1)) + pad);
+  if (x1 <= x0 || y1 <= y0) return null;
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+function normWord(s) {
+  return String(s || '').toLowerCase().replace(/[^0-9a-z]+/g, '');
+}
+
+function decodeXmlText(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
 function resolveFont(name) {
   try {
     return execFileSync('kpsewhich', [name], { encoding: 'utf8' }).trim();
@@ -1664,6 +2066,10 @@ function push2(list, kind, key, blockId) {
 
 function r2(v) {
   return Math.round(v * 100) / 100;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 class Timer {
