@@ -122,6 +122,16 @@ A small badge (`#preview-state`) in the Preview pane title:
    page">page N</span>` badges that a bare `.page` selector will match (this cost time
    during verification — it looked like stale empty pages but was not).
 
+## Task for Fable tomorrow
+
+Live preview becomes extremely slow when the document contains two-column layout.
+Investigate the cause and choose one of these fixes:
+
+1. If there is an algorithmic way to make the live preview fundamentally faster,
+   migrate to that approach.
+2. If there is no practical fast path, show an intermediate preview state first and
+   then render the correct preview asynchronously with delay.
+
 ## Touch points
 
 - `engine/checkpoint/engine-v3.js`: `#fullPagePreview`, `#assembleFullPagePages`,
