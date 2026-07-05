@@ -5,7 +5,8 @@
       "name": "tdom",
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.js"],
-      "port": 4633
+      "port": 4633,
+      "autoPort": true
     }
   ]
 }
